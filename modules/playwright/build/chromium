@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Resolve the executable from the same Playwright release that downloaded it.
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/opt/playwright-browsers}"
+browser="$(node -p 'require("/opt/playwright/node_modules/playwright").chromium.executablePath()')"
+exec "$browser" "$@"

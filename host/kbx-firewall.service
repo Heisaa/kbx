@@ -1,0 +1,16 @@
+[Unit]
+Description=kbx sandbox firewall (block sandbox access to the host and LAN)
+Documentation=file:///usr/local/share/doc/kbx/host-setup.md
+After=docker.service
+# Restarting Docker can drop the DOCKER-USER jump; re-apply with it.
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/kbx-firewall start
+ExecReload=/usr/local/sbin/kbx-firewall start
+ExecStop=/usr/local/sbin/kbx-firewall stop
+
+[Install]
+WantedBy=multi-user.target docker.service

@@ -1,0 +1,53 @@
+# kbx configuration: copy to ~/.config/kbx/config.toml (or $XDG_CONFIG_HOME/kbx/).
+# Every setting is optional; the values below are the defaults unless noted.
+# Projects can never configure kbx: project files are untrusted.
+
+[modules]
+# Override each module's own default (see `kbx check` for the list).
+# clipboard = true            # image paste for all agents (on by default)
+# codex-chatgpt-auth = true   # Codex uses ChatGPT login (needed for remote control)
+# node-toolchain = false
+# playwright = false
+# claude-statusline = false
+# codex-statusline = false
+# codex-reset-fast = false
+# my-claude-defaults = true   # a user module in ~/.config/kbx/modules/
+
+# [options.node-toolchain]
+# version = "26"              # major, exact x.y.z, or "" to keep the core LTS
+# apt = "postgresql-client"
+# npm = "typescript@5.9.2 pnpm"
+
+# [options.playwright]
+# version = "1.63.0"
+
+[launcher]
+# Overridable per run as KBX_<NAME>, e.g. KBX_REMOTE_CONTROL=false kbx claude
+# auto_update = true          # update the launched agent before starting it
+# remote_control = true       # Claude: --remote-control; Codex: remote-control start
+# codex_search = true         # Codex web search flags
+# shared_skills = true        # stage [skills] sources and link them for the agents
+# detach_key = "^\\"          # dtach detach key (Ctrl-\); "none" disables it
+# memory = "8g"               # VM size, applied at create (`kbx recreate` to change)
+# cpus = 4
+# dns = ["1.1.1.1", "9.9.9.9"]
+# debug = false               # claude --debug
+# docker_disk = "64g"         # sparse ext4 image for the inner Docker
+
+[network]
+# name = "kbx"
+# subnet = "172.30.0.0/24"
+# bridge = "br-kbx"           # must match /etc/kbx/firewall.conf (host/install-firewall)
+
+[image]
+# name = "kbx-agent"
+
+[runtime]
+# name = "kata"               # Docker runtime name registered in daemon.json
+# privileges = "caps"         # "privileged" fails under Kata 4 (risk R1)
+# docker_storage = "loop"     # or "volume" (runc only: overlayfs fails on virtio-fs) (risk R2)
+
+[skills]
+# Directories whose entries are skills; the first source wins on a name clash.
+# Missing directories are skipped.
+# sources = ["~/.agents/skills"]

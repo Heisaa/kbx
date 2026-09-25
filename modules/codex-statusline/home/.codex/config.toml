@@ -1,0 +1,2 @@
+[tui]
+status_line = ["context-used", "five-hour-limit", "weekly-limit"]

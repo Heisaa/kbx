@@ -1,0 +1,2 @@
+description = "Claude Code status line: sandbox, model, dir, branch, context, plan quota"
+default = false

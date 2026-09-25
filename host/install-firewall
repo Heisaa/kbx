@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Install and start the kbx host firewall (run as root):
+#
+#   sudo host/install-firewall [--bridge br-kbx] [--extra-blocked "CIDR …"]
+#
+# The bridge name must match [network] bridge in ~/.config/kbx/config.toml.
+set -euo pipefail
+
+bridge=br-kbx
+extra=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --bridge) bridge="${2:?}"; shift 2 ;;
+    --extra-blocked) extra="${2:?}"; shift 2 ;;
+    *) echo "usage: install-firewall [--bridge NAME] [--extra-blocked \"CIDR …\"]" >&2; exit 2 ;;
+  esac
+done
+[ "$(id -u)" -eq 0 ] || { echo "install-firewall: run as root (sudo)" >&2; exit 1; }
+[[ "$bridge" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || { echo "install-firewall: invalid bridge name" >&2; exit 1; }
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+install -D -m 0755 "$here/kbx-firewall.sh" /usr/local/sbin/kbx-firewall
+install -D -m 0644 "$here/kbx-firewall.service" /etc/systemd/system/kbx-firewall.service
+install -d -m 0755 /etc/kbx
+printf 'BRIDGE=%s\nEXTRA_BLOCKED="%s"\n' "$bridge" "$extra" > /etc/kbx/firewall.conf
+install -D -m 0644 "$here/../docs/host-setup.md" /usr/local/share/doc/kbx/host-setup.md
+systemctl daemon-reload
+systemctl enable kbx-firewall.service
+systemctl restart kbx-firewall.service
+systemctl --no-pager status kbx-firewall.service | head -5

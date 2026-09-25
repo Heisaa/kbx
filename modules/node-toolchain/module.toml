@@ -1,0 +1,7 @@
+description = "A chosen Node.js version from nodejs.org, plus extra apt and global npm packages"
+default = false
+
+[options]
+version = { default = "26", pattern = '^([0-9]+|[0-9]+\.[0-9]+\.[0-9]+)?$', description = "Node major (26), exact version (26.8.1), or empty to keep the core LTS" }
+apt = { default = "", pattern = '^([a-z0-9][a-z0-9+.:=~-]*( [a-z0-9][a-z0-9+.:=~-]*)*)?$', description = "Extra apt packages, space separated" }
+npm = { default = "", pattern = '^([A-Za-z0-9@][A-Za-z0-9@/._^~<>=*+-]*( [A-Za-z0-9@][A-Za-z0-9@/._^~<>=*+-]*)*)?$', description = "Extra global npm packages, space separated (versions may be pinned)" }

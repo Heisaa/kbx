@@ -1,0 +1,8 @@
+description = "Codex uses ChatGPT login (required for Codex remote control)"
+default = true
+
+[seed]
+enforce = [
+  ".codex/config.toml:forced_login_method",
+  ".codex/config.toml:model_provider",
+]

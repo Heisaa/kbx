@@ -1,0 +1,8 @@
+# Only uncommented keys are seeded; comments alone seed nothing.
+# model = "gpt-5-codex"
+# model_reasoning_effort = "high"
+# approval_policy = "never"
+# sandbox_mode = "danger-full-access"   # the kbx VM is the sandbox
+#
+# [features]
+# fast_mode = false                     # remove the /fast toggle entirely

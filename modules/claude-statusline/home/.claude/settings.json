@@ -1,0 +1,7 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node /home/agent/.claude/statusline.mjs",
+    "padding": 0
+  }
+}

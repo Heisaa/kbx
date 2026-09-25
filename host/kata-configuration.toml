@@ -1,0 +1,23 @@
+# Settings kbx expects in /etc/kata-containers/configuration.toml (a copy of
+# /opt/kata/share/defaults/kata-containers/configuration-clh.toml).
+# Edit the matching keys in that file; this is not a drop-in. Verify each one
+# with host/spike.sh and record the outcome in host/README.md.
+
+[hypervisor.clh]
+# Base VM size. Docker's --memory/--cpus (kbx: [launcher] memory, cpus) are
+# hot-added on top when the runtime supports it (risk R5). If `free -m` and
+# `nproc` inside a sandbox stay near these values, raise them instead.
+default_vcpus = 1
+default_memory = 2048
+# Upper bound for hot-added vCPUs; 0 means the host's CPU count.
+default_maxvcpus = 0
+# virtio-fs shares the container rootfs and the read-only stage mount.
+shared_fs = "virtio-fs"
+
+[runtime]
+# Keep the guest's cgroups inside the sandbox cgroup Docker created, so
+# Docker's limits apply to the whole VM.
+sandbox_cgroup_only = true
+# Risk R1: `--privileged` containers fail to start under Kata 4 (the agent
+# cannot recreate Docker's host device list), so kbx defaults to
+# `[runtime] privileges = "caps"` rather than changing Kata.

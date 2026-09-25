@@ -1,0 +1,295 @@
+"""End to end through bin/kbx with the fake docker, under a pseudo-terminal."""
+
+from __future__ import annotations
+
+import json
+import os
+import pty
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from tests.unit.helpers import KBX, TempHome
+from tests.unit.helpers import git as run_git
+
+
+class CliTest(TempHome):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.make_repo("myproj")
+        self.add_image()
+
+    def tty(self, *args: str, cwd: Path | None = None, env: dict[str, str] | None = None) -> tuple[int, str]:
+        master, slave = pty.openpty()
+        full_env = dict(self.env)
+        full_env.update(env or {})
+        process = subprocess.Popen(
+            [sys.executable, str(KBX), *args],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            cwd=str(cwd or self.repo),
+            env=full_env,
+            close_fds=True,
+        )
+        os.close(slave)
+        chunks: list[bytes] = []
+        while True:
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            chunks.append(data)
+        os.close(master)
+        status = process.wait(timeout=60)
+        return status, b"".join(chunks).decode("utf-8", "replace").replace("\r\n", "\n")
+
+    def attached(self) -> dict[str, Any]:
+        path = self.state_dir / "attached.json"
+        self.assertTrue(path.exists(), "nothing was attached")
+        return json.loads(path.read_text())
+
+    def exec_calls(self) -> list[list[str]]:
+        return [c for c in self.calls() if c[:1] == ["exec"]]
+
+    def sandbox_name(self) -> str:
+        return next(iter(self.docker_state()["containers"]))
+
+    def test_first_launch_claude(self) -> None:
+        status, output = self.tty("claude", "--resume")
+        self.assertEqual(status, 0, output)
+        self.assertIn("fake-attached", output)
+        attached = self.attached()
+        self.assertEqual(attached["herdr"], "claude")
+        self.assertEqual(
+            attached["argv"],
+            [
+                "dtach",
+                "-A",
+                "/run/kbx/sessions/claude.sock",
+                "-e",
+                "^\\",
+                "-r",
+                "winch",
+                "claude",
+                "--resume",
+                "--remote-control",
+            ],
+        )
+        final = self.exec_calls()[-1]
+        self.assertEqual(final[:3], ["exec", "-i", "-t"])
+        self.assertIn("DISPLAY=:0", final)
+        self.assertEqual(final[final.index("-w") + 1], "/home/agent/work/myproj")
+        self.assertTrue((self.sandbox_home / "work" / "myproj" / "README.md").exists(), "clone seeded")
+        joined = [" ".join(c) for c in self.exec_calls()]
+        self.assertTrue(any("claude update" in c for c in joined), "auto-update ran")
+        self.assertTrue(any("kbx-seed --only-prefix .claude/" in c for c in joined))
+        self.assertTrue(any("sys.exit(0 if exc.errno" in c for c in joined), "firewall probe ran")
+        self.assertTrue((self.home / ".local/share/kbx/stage/config.json").exists())
+        self.assertIn("Detach with Ctrl-\\", output)
+
+    def test_reattach_skips_update_and_prelaunch(self) -> None:
+        self.tty("claude")
+        self.clear_calls()
+        self.behave(sessions=["claude"])
+        status, output = self.tty("claude", "--ignored")
+        self.assertEqual(status, 0, output)
+        self.assertIn("Reattaching", output)
+        self.assertEqual(self.attached()["argv"][:2], ["dtach", "-a"])
+        joined = [" ".join(c) for c in self.exec_calls()]
+        self.assertFalse(any("update" in c for c in joined))
+        self.assertFalse(any("kbx-seed" in c for c in joined))
+
+    def test_firewall_missing_refuses_to_attach(self) -> None:
+        self.behave(firewall=3)
+        status, output = self.tty("claude")
+        self.assertEqual(status, 1)
+        self.assertIn("host firewall is not active", output)
+        self.assertFalse((self.state_dir / "attached.json").exists())
+
+    def test_update_failure_still_launches(self) -> None:
+        self.behave(update_status=1)
+        status, output = self.tty("pi")
+        self.assertEqual(status, 0, output)
+        self.assertIn("pi update failed", output)
+        self.assertEqual(self.attached()["argv"][-1], "pi")
+
+    def test_auto_update_off(self) -> None:
+        self.tty("pi", env={"KBX_AUTO_UPDATE": "false"})
+        joined = [" ".join(c) for c in self.exec_calls()]
+        self.assertFalse(any("npm install" in c for c in joined))
+
+    def test_codex_prelaunch(self) -> None:
+        config = self.home / ".config/kbx/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text("[modules]\ncodex-reset-fast = true\n")
+        status, output = self.tty("codex")
+        self.assertEqual(status, 0, output)
+        joined = [" ".join(c) for c in self.exec_calls()]
+        self.assertTrue(any(c.endswith("kbx-init run-start codex-reset-fast") and "-u agent" in c for c in joined))
+        self.assertTrue(any("codex remote-control start" in c for c in joined))
+        argv = self.attached()["argv"]
+        self.assertIn("forced_login_method=chatgpt", argv)
+        self.assertIn("--search", argv)
+
+    def test_codex_not_logged_in(self) -> None:
+        self.behave(codex_login=False)
+        status, output = self.tty("codex")
+        self.assertEqual(status, 0, output)
+        self.assertIn("codex login --device-auth", output)
+        self.assertFalse(any("remote-control start" in " ".join(c) for c in self.exec_calls()))
+
+    def test_not_a_git_repository(self) -> None:
+        plain = self.temp / "plain"
+        plain.mkdir()
+        result = self.run_kbx("claude", cwd=plain)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("git init && git commit --allow-empty -m init", result.stderr)
+        self.assertEqual(self.docker_state()["containers"], {})
+
+    def test_missing_image(self) -> None:
+        state = self.docker_state()
+        state["images"] = {}
+        self.write_state(state)
+        result = self.run_kbx("shell", cwd=self.repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("kbx build", result.stderr)
+
+    def test_attach(self) -> None:
+        result = self.run_kbx("attach", cwd=self.repo)
+        self.assertIn("no sandbox", result.stderr)
+        self.tty("claude")
+        self.behave(sessions=[])
+        self.assertIn("no running sessions", self.run_kbx("attach", cwd=self.repo).stderr)
+        self.behave(sessions=["claude", "codex"])
+        self.assertIn("several sessions", self.run_kbx("attach", cwd=self.repo).stderr)
+        self.behave(sessions=["codex"])
+        status, output = self.tty("attach")
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.attached()["argv"][:3], ["dtach", "-a", "/run/kbx/sessions/codex.sock"])
+
+    def test_attach_needs_a_terminal(self) -> None:
+        self.tty("claude")
+        self.behave(sessions=["claude"])
+        result = self.run_kbx("attach", "claude", cwd=self.repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("needs a terminal", result.stderr)
+
+    def test_shell(self) -> None:
+        status, output = self.tty("shell")
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.attached()["argv"], ["bash", "-l"])
+
+    def test_rm_asks_and_lists_unfetched(self) -> None:
+        self.tty("claude")
+        clone = self.sandbox_home / "work" / "myproj"
+        sandbox_env = {k: v for k, v in os.environ.items() if k != "GIT_CONFIG_GLOBAL"}
+        sandbox_env["HOME"] = str(self.sandbox_home)
+        run_git(clone, "checkout", "-q", "-b", "agent-work", env=sandbox_env)
+        (clone / "x.txt").write_text("x")
+        run_git(clone, "add", "x.txt", env=sandbox_env)
+        run_git(clone, "commit", "-q", "-m", "x", env=sandbox_env)
+        name = self.sandbox_name()
+        result = self.run_kbx("rm", cwd=self.repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("agent-work  (1 commit(s))", result.stdout)
+        self.assertIn("Nothing deleted", result.stdout)
+        self.assertIn(name, self.docker_state()["containers"])
+        self.assertIn(f"{name}-home", self.docker_state()["volumes"])
+        result = self.run_kbx("rm", "--yes", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.docker_state()["containers"], {})
+        self.assertNotIn(f"{name}-home", self.docker_state()["volumes"])
+
+    def test_stop_and_recreate_keep_volumes(self) -> None:
+        self.tty("claude")
+        name = self.sandbox_name()
+        self.assertEqual(self.run_kbx("stop", cwd=self.repo).returncode, 0)
+        self.assertEqual(self.docker_state()["containers"][name]["State"]["Status"], "exited")
+        result = self.run_kbx("recreate", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.docker_state()["containers"][name]["State"]["Status"], "created")
+        self.assertIn(f"{name}-home", self.docker_state()["volumes"])
+        self.assertFalse(any(c[:2] == ["volume", "rm"] for c in self.calls()))
+
+    def test_fetch_and_sync(self) -> None:
+        self.tty("claude")
+        result = self.run_kbx("sync", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_kbx("fetch", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kbx/main", result.stdout)
+
+    def test_ls(self) -> None:
+        self.assertIn("No kbx sandboxes", self.run_kbx("ls").stdout)
+        self.tty("claude")
+        self.behave(sessions=["claude"])
+        out = self.run_kbx("ls").stdout
+        self.assertIn("running", out)
+        self.assertIn("claude", out)
+        self.assertIn(str(self.repo), out)
+
+    def test_build_and_drift(self) -> None:
+        result = self.run_kbx("build")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dockerfile = (self.state_dir / "Dockerfile.last").read_text()
+        self.assertIn("# --- module: clipboard (builtin) ---", dockerfile)
+        labels = self.docker_state()["images"]["kbx-agent"]["Config"]["Labels"]
+        self.assertIn("kbx.modules-hash", labels)
+        self.assertIn("kbx.module.clipboard", labels)
+        config = self.home / ".config/kbx/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text("[modules]\nplaywright = true\n")
+        status, output = self.tty("shell")
+        self.assertEqual(status, 0, output)
+        self.assertIn("module playwright was enabled; run `kbx build && kbx recreate`", output)
+        print_result = self.run_kbx("build", "--print")
+        self.assertIn("module: playwright", print_result.stdout)
+
+    def test_check(self) -> None:
+        result = self.run_kbx("check")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("[on ] clipboard", result.stdout)
+        self.assertIn("[off] playwright", result.stdout)
+        config = self.home / ".config/kbx/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text("[modules]\nnope = true\n")
+        result = self.run_kbx("check")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unknown module", result.stdout)
+
+    def test_seed_command(self) -> None:
+        self.tty("claude")
+        self.assertEqual(self.run_kbx("seed", "--status", cwd=self.repo).returncode, 0)
+        result = self.run_kbx("seed", "--reset", "codex-chatgpt-auth", cwd=self.repo)
+        self.assertEqual(result.returncode, 1, "reset needs confirmation")
+        result = self.run_kbx("seed", "--reset", "codex-chatgpt-auth", "--yes", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c[-3:] == ["kbx-seed", "--reset", "codex-chatgpt-auth"] for c in self.calls()))
+
+    def test_clipboard_tools_missing_warns_once(self) -> None:
+        _, first = self.tty("claude", env={"PATH": self.env["PATH"]})
+        self.assertIn("image paste is off", first)
+        _, second = self.tty("claude")
+        self.assertNotIn("image paste is off", second)
+
+    def test_errors_are_one_line(self) -> None:
+        config = self.home / ".config/kbx/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text("[launcher]\ncpus = -1\n")
+        result = self.run_kbx("ls")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr.strip().count("\n"), 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        result = self.run_kbx("ls", extra_env={"KBX_DEBUG": "1"})
+        self.assertIn("Traceback", result.stderr)
+
+    def test_start_without_attaching(self) -> None:
+        result = self.run_kbx("start", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("is running", result.stdout)
+        self.assertTrue((self.sandbox_home / "work" / "myproj" / ".git").is_dir())
+        self.assertFalse((self.state_dir / "attached.json").exists())

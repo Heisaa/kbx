@@ -1,0 +1,3 @@
+#!/bin/sh
+# Supervised by kbx-init: starts Xvfb :0 and serves ~/.cache/kbx-clipboard.
+exec kbx-clip-bridge --display :0

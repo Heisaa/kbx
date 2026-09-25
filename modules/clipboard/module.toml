@@ -1,0 +1,5 @@
+description = "Image paste for all agents: Xvfb :0 plus a CLIPBOARD owner fed by the host"
+default = true
+
+[service]
+user = "agent"

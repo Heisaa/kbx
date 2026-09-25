@@ -1,0 +1,70 @@
+# kbx core image. `kbx build` appends one RUN layer per enabled module with a
+# build.sh, then copies the agents' home template in; see kbx/image.py.
+# Build context: the repository's image/ and kbx_sandbox/ plus modules/<name>/.
+
+FROM debian:trixie AS core
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash-completion build-essential ca-certificates curl dtach e2fsprogs file \
+      git git-lfs gnupg iproute2 iptables iputils-ping jq less libatomic1 locales \
+      procps psmisc python3 python3-tomlkit ripgrep sudo tini tzdata unzip \
+      util-linux xz-utils zip \
+ && rm -rf /var/lib/apt/lists/*
+
+# Docker Engine, buildx and compose from docker.com.
+RUN install -m 0755 -d /etc/apt/keyrings \
+ && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+ && chmod a+r /etc/apt/keyrings/docker.asc \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable" \
+      > /etc/apt/sources.list.d/docker.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin \
+ && rm -rf /var/lib/apt/lists/*
+
+# The sandbox user. It is root in the VM anyway (through Docker), so sudo is passwordless.
+RUN useradd --create-home --uid 1000 --user-group --shell /bin/bash --groups docker agent \
+ && printf 'agent ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/agent \
+ && chmod 0440 /etc/sudoers.d/agent \
+ && printf 'prefix=/usr/local\n' > /root/.npmrc
+
+# Node (current LTS by default), checksum-verified. pi and statuslines need it.
+COPY image/install-node /usr/local/lib/kbx/install-node
+ARG NODE_VERSION=lts
+RUN /usr/local/lib/kbx/install-node "$NODE_VERSION"
+
+COPY image/update-codex-native /usr/local/bin/update-codex-native
+COPY kbx_sandbox /usr/local/lib/kbx/kbx_sandbox
+COPY image/bin/ /usr/local/bin/
+RUN python3 -m compileall -q /usr/local/lib/kbx/kbx_sandbox \
+ && mkdir -p /opt/kbx/stage /opt/kbx/home-template /var/lib/kbx-docker /var/log/kbx
+
+# The volume's copies of the agents win over anything in /usr.
+ENV PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LANG=C.UTF-8
+
+# --- agents, installed as `agent` into the home directory so updates persist ---
+FROM core AS agents
+# `kbx build --refresh-agents` changes this to reinstall the latest versions.
+ARG KBX_AGENTS_REFRESH=0
+USER agent
+WORKDIR /home/agent
+RUN printf 'prefix=/home/agent/.local\n' > ~/.npmrc \
+ && mkdir -p ~/.local/bin ~/.local/state/kbx ~/work
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+ && ~/.local/bin/claude --version
+RUN update-codex-native \
+ && ~/.local/bin/codex --version
+RUN npm install -g --no-fund --no-audit @earendil-works/pi-coding-agent \
+ && ~/.local/bin/pi --version
+# Installer caches are not needed in every sandbox. The marker is present in a
+# home seeded from this template; kbx-init copies it only once.
+RUN rm -rf ~/.npm ~/.cache ~/.codex/tmp \
+ && date -u +%FT%TZ > ~/.local/state/kbx/home-template
+
+# --- the final image ---
+FROM core
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/kbx-init"]

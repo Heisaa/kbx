@@ -1,0 +1,9 @@
+description = "Playwright with Chromium, plus a chromium wrapper (adds about 500 MB)"
+default = false
+
+[options]
+version = { default = "1.63.0", pattern = '^([0-9]+\.[0-9]+\.[0-9]+|latest)$', description = "@playwright/test version" }
+
+[env]
+PLAYWRIGHT_BROWSERS_PATH = "/opt/playwright-browsers"
+NODE_PATH = "/opt/playwright/node_modules"

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Install or update native Codex for the current user (the sandbox's `agent`).
+# The binary lands in ~/.local/bin and its releases in ~/.codex, both in the
+# home volume, so updates persist across `kbx stop` and `kbx recreate`.
+set -euo pipefail
+
+if [ "$(id -u)" -eq 0 ]; then
+  echo "update-codex-native: run as the agent user, not root" >&2
+  exit 1
+fi
+
+# Download fully before executing: a failed download must fail the update.
+installer="$(mktemp)"
+trap 'rm -f "$installer"' EXIT
+curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+  https://chatgpt.com/codex/install.sh -o "$installer"
+CODEX_NON_INTERACTIVE=1 CODEX_RELEASE="${CODEX_RELEASE:-latest}" sh "$installer"
+
+installed="$(readlink -f "$HOME/.local/bin/codex" 2>/dev/null || true)"
+case "$installed" in
+  "$HOME"/*) ;;
+  *) echo "update-codex-native: codex was not installed under $HOME (got '${installed:-nothing}')" >&2; exit 1 ;;
+esac

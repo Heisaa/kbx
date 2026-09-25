@@ -1,0 +1,6 @@
+description = "Remove a persisted Codex Fast mode (service_tier = \"fast\") at every start and before each Codex launch"
+default = false
+
+[start]
+user = "agent"
+before_launch = ["codex"]

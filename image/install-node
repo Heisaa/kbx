@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Install an official Node.js build from nodejs.org, verifying its checksum.
+#
+#   install-node lts | <major> | <x.y.z>
+#
+# Layout: /opt/node/<version>, /opt/node/current → it, and node/npm/npx/
+# corepack linked into /usr/local/bin. Used by the core image (current LTS)
+# and by the node-toolchain module (a chosen version). Runs as root at build.
+set -euo pipefail
+
+NODE_PREFIX=/opt/node
+DIST="${NODE_DIST_URL:-https://nodejs.org/dist}"
+requested="${1:?usage: install-node lts|<major>|<x.y.z>}"
+
+log() { printf 'install-node: %s\n' "$*"; }
+
+case "$(uname -m)" in
+  x86_64) arch=x64 ;;
+  aarch64 | arm64) arch=arm64 ;;
+  *) log "unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+
+if [ "$requested" = lts ]; then
+  # index.json is newest first; the first entry with an "lts" codename wins.
+  requested="$(curl -fsSL --retry 3 --retry-delay 2 "$DIST/index.json" |
+    jq -r 'map(select(.lts != false))[0].version' | sed 's/^v//')"
+  [ -n "$requested" ] && [ "$requested" != null ] || { log "cannot resolve the current LTS" >&2; exit 1; }
+fi
+
+if [[ "$requested" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  release_dir="$DIST/v$requested"
+elif [[ "$requested" =~ ^[0-9]+$ ]]; then
+  release_dir="$DIST/latest-v$requested.x"
+else
+  log "invalid Node version: $requested" >&2
+  exit 1
+fi
+
+# SHASUMS256.txt yields both the exact filename (the patch version floats
+# within a major) and its checksum, in a single request.
+sums="$(curl -fsSL --retry 3 --retry-delay 2 "$release_dir/SHASUMS256.txt")"
+tarball="$(awk -v a="linux-$arch.tar.gz" '$2 ~ ("node-v.*-" a "$") {print $2; exit}' <<<"$sums")"
+[ -n "$tarball" ] || { log "no linux-$arch build in release $requested" >&2; exit 1; }
+version="${tarball#node-}"
+version="${version%%-linux-*}" # -> v24.9.0
+
+if [ "$(/usr/local/bin/node --version 2>/dev/null || true)" = "$version" ]; then
+  log "node $version already installed"
+  exit 0
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+curl -fsSL --retry 3 --retry-delay 2 -o "$tmp/$tarball" "$release_dir/$tarball"
+grep -F " $tarball" <<<"$sums" >"$tmp/SHASUMS256.txt"
+(cd "$tmp" && sha256sum -c --status SHASUMS256.txt) || { log "checksum mismatch for $tarball" >&2; exit 1; }
+
+mkdir -p "$NODE_PREFIX"
+rm -rf "${NODE_PREFIX:?}/$version"
+tar -xzf "$tmp/$tarball" -C "$NODE_PREFIX"
+mv "$NODE_PREFIX/${tarball%.tar.gz}" "$NODE_PREFIX/$version"
+ln -sfn "$NODE_PREFIX/$version" "$NODE_PREFIX/current"
+for b in node npm npx corepack; do
+  if [ -e "$NODE_PREFIX/current/bin/$b" ]; then
+    ln -sfn "$NODE_PREFIX/current/bin/$b" "/usr/local/bin/$b"
+  fi
+done
+find "$NODE_PREFIX" -mindepth 1 -maxdepth 1 -name 'v*' ! -name "$version" -exec rm -rf {} +
+log "node $(/usr/local/bin/node --version)"

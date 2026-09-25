@@ -1,0 +1,49 @@
+# Tool configuration only: kbx has nothing to install (see README.md).
+[project]
+name = "kbx"
+version = "0.1.0"
+description = "Agent sandboxes on Kata Containers"
+requires-python = ">=3.11"
+license = "MIT"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["porting"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PL", "S"]
+ignore = [
+  "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004", # complexity counts
+  "S603", "S607",                                        # subprocess is the job here
+  "S108",                                                # /tmp paths inside the sandbox
+  "RUF001", "RUF003",                                    # arrows and dashes in messages
+  "PLW0603",                                             # init's log handle
+  "E501",
+  "SIM102", "SIM105", "SIM108", "SIM401",                # readability calls
+  "S101",                                                # asserts document invariants
+  "S103",                                                # the stage is world-readable on purpose
+  "S606",                                                # execvpe hands over the terminal
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "PLC0415"]
+"bin/kbx" = ["UP036"]                                    # the version check is the point
+"kbx_sandbox/bridge.py" = ["PLW1509"]                    # single-threaded; sets PDEATHSIG
+
+[tool.ruff.format]
+
+[tool.pyright]
+include = ["kbx", "kbx_sandbox", "tests"]
+exclude = ["porting", "**/__pycache__"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportPrivateUsage = false
+# JSON from docker/config files and the untyped Xlib/tomlkit APIs are Any by
+# nature; these four reports only restate that.
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportUnknownLambdaType = false
+reportUnknownParameterType = false
