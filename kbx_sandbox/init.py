@@ -1,6 +1,8 @@
 """kbx-init: runs as root under tini on every container start (every Kata VM boot).
 
-1. Copy the image's home template into a new, empty home volume.
+1. Copy the image's home template into a new, empty home volume. In mount
+   mode, give `agent` the host user's uid/gid (files in the shared checkout
+   keep their owner).
 2. Point DNS at the configured resolvers if Docker's embedded one is unreachable.
 3. Mount inner Docker's storage (ext4 image file, loop-mounted).
 4. Link skills, run kbx-seed as agent, run each module's start.sh.
@@ -14,6 +16,7 @@
 from __future__ import annotations
 
 import collections
+import grp
 import json
 import os
 import pwd
@@ -135,6 +138,45 @@ def makedirs_agent(path: Path, agent: User) -> None:
 
 
 # --- boot steps ---
+
+
+def remap_agent(env: Mapping[str, str]) -> None:
+    """Give `agent` the host user's ids (KBX_HOST_UID/GID, set in mount mode)."""
+    try:
+        uid, gid = int(env["KBX_HOST_UID"]), int(env["KBX_HOST_GID"])
+    except (KeyError, ValueError):
+        return
+    agent = pwd.getpwnam("agent")
+    old_uid, old_gid = agent.pw_uid, agent.pw_gid
+    if (uid, gid) == (old_uid, old_gid):
+        return
+    if gid != old_gid:
+        try:
+            owner = grp.getgrgid(gid).gr_name
+        except KeyError:
+            owner = None
+        if owner is not None:
+            log(f"ids: gid {gid} belongs to group {owner} in the image; keeping agent's gid {old_gid}")
+            gid = old_gid
+        else:
+            subprocess.run(["groupmod", "-g", str(gid), "agent"], check=True, capture_output=True)
+    if uid != old_uid:
+        try:
+            owner = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            owner = None
+        if owner is not None:
+            log(f"ids: uid {uid} belongs to {owner} in the image; keeping agent's uid {old_uid}")
+            uid = old_uid
+        else:
+            subprocess.run(["usermod", "-u", str(uid), "-g", str(gid), "agent"], check=True, capture_output=True)
+    if (uid, gid) == (old_uid, old_gid):
+        return
+    # usermod only fixes the home directory's top; the volume keeps the old ids.
+    subprocess.run(["chown", "-R", "-h", f"--from={old_uid}:{old_gid}", f"{uid}:{gid}", str(HOME)], check=False)
+    subprocess.run(["chown", "-R", "-h", f"--from={old_uid}", str(uid), str(HOME)], check=False)
+    subprocess.run(["chown", "-R", "-h", f"--from=:{old_gid}", f":{gid}", str(HOME)], check=False)
+    log(f"ids: agent is now {uid}:{gid} (was {old_uid}:{old_gid}), like the host user")
 
 
 def copy_home_template(agent: User) -> None:
@@ -552,13 +594,18 @@ def boot() -> int:
     SERVICE_LOGS.mkdir(parents=True, exist_ok=True)
     _log_handle = LOG.open("a")
     log(f"init: boot {boot_id()}")
+    prepare_cgroups()
+    # The template carries the image's ids; the remap then moves the whole home.
+    copy_home_template(User.lookup("agent"))
+    try:
+        remap_agent(os.environ)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        log(f"ids: cannot give agent the host user's ids: {exc}")
     agent = User.lookup("agent")
     root = User.lookup("root")
     SESSIONS.mkdir(mode=0o700, exist_ok=True)
     chown_agent(SESSIONS, agent)
 
-    prepare_cgroups()
-    copy_home_template(agent)
     config = load_config()
     fix_dns(config.get("dns") or [])
     storage, docker_args = setup_docker_storage(config)

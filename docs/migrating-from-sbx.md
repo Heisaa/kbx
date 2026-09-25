@@ -8,7 +8,8 @@ once as a kbx config plus user modules, usually kept in your dotfiles.
 
 | sbx | kbx |
 | --- | --- |
-| Host-mounted workspace (or clone mode + git-daemon) | Private clone in the sandbox; `kbx fetch`/`kbx sync` via bundles |
+| Host-mounted workspace | The same by default (mount mode, at the same path), plus a host-side guard against planted git hooks and config |
+| Clone mode + git-daemon | Clone mode: a private clone; `kbx fetch`/`kbx sync` via bundles |
 | Egress proxy, per-domain policy, credential injection | Open internet; logins live in the sandbox; nothing injected |
 | Kits applied at create time (YAML specs, templating) | Modules: build layer, declarative seeds, services, `start.sh`; seeds and services apply at every start |
 | `sbx run` | `kbx claude\|codex\|pi`, attached through dtach (detach with `Ctrl-\`) |

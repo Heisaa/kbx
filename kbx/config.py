@@ -71,6 +71,38 @@ class RuntimeConfig:
     docker_storage: str = "loop"
 
 
+# Files in the checkout that host tools run without asking: hook scripts and
+# hook-framework configs (run by `git commit` on the host), editor settings and
+# tasks. In mount mode the guard reverts agent changes to them.
+DEFAULT_PROTECT = (
+    ".husky",
+    ".githooks",
+    ".lefthook",
+    ".pre-commit-config.yaml",
+    ".pre-commit-config.yml",
+    "lefthook.yml",
+    "lefthook.yaml",
+    ".lefthook.yml",
+    ".lefthook.yaml",
+    "lefthook-local.yml",
+    "lefthook-local.yaml",
+    ".lefthook-local.yml",
+    ".lefthook-local.yaml",
+    ".vscode/settings.json",
+    ".vscode/tasks.json",
+)
+
+
+@dataclass(frozen=True)
+class WorkspaceConfig:
+    # "mount": the sandbox works in the host checkout, bind-mounted at the same
+    # path. "clone": a private clone in the sandbox; git crosses as bundles.
+    mode: str = "mount"
+    # Mount mode: the host-side guard (kbx/guard.py). Off only for development.
+    guard: bool = True
+    protect: tuple[str, ...] = DEFAULT_PROTECT
+
+
 @dataclass(frozen=True)
 class SkillsConfig:
     sources: tuple[Path, ...] = ()
@@ -82,6 +114,7 @@ class Config:
     network: NetworkConfig = field(default_factory=NetworkConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     modules: Mapping[str, bool] = field(default_factory=dict[str, bool])
     options: Mapping[str, Mapping[str, OptionValue]] = field(default_factory=dict[str, Mapping[str, OptionValue]])
@@ -226,6 +259,28 @@ def _runtime(table: dict[str, Any], env: Mapping[str, str], where: str) -> Runti
     return RuntimeConfig(name=name, privileges=privileges, docker_storage=storage)
 
 
+def _workspace(table: dict[str, Any], env: Mapping[str, str], where: str) -> WorkspaceConfig:
+    defaults = WorkspaceConfig()
+    _reject_unknown(table, set(WorkspaceConfig.__dataclass_fields__), where)
+    mode = env.get("KBX_WORKSPACE") or _str(table, "mode", defaults.mode, where)
+    if mode not in ("mount", "clone"):
+        raise KbxError(f'{where}.mode must be "mount" or "clone" (KBX_WORKSPACE too)')
+    raw_guard = env.get("KBX_GUARD")
+    guard = (
+        parse_bool(raw_guard, "KBX_GUARD") if raw_guard is not None else _bool(table, "guard", defaults.guard, where)
+    )
+    raw: Any = table.get("protect", list(defaults.protect))
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):  # pyright: ignore[reportUnknownVariableType]
+        raise KbxError(f"{where}.protect must be a list of paths relative to the project")
+    protect: list[str] = []
+    for item in [str(entry) for entry in raw]:  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType]
+        parts = Path(item).parts
+        if not parts or Path(item).is_absolute() or ".." in parts or parts[0] == ".git":
+            raise KbxError(f"{where}.protect: {item!r} must be a relative path inside the project, outside .git")
+        protect.append(str(Path(item)))
+    return WorkspaceConfig(mode=mode, guard=guard, protect=tuple(protect))
+
+
 def _skills(table: dict[str, Any], home: Path, where: str) -> SkillsConfig:
     _reject_unknown(table, {"sources"}, where)
     raw: Any = table.get("sources", ["~/.agents/skills"])
@@ -278,13 +333,14 @@ def load(paths: Paths, env: Mapping[str, str]) -> Config:
 
 
 def parse(data: Mapping[str, Any], paths: Paths, env: Mapping[str, str], where: str) -> Config:
-    sections = {"launcher", "network", "image", "runtime", "skills", "modules", "options"}
+    sections = {"launcher", "network", "image", "runtime", "workspace", "skills", "modules", "options"}
     _reject_unknown(data, sections, where)
     return Config(
         launcher=_launcher(_table(data, "launcher", where), env, "[launcher]"),
         network=_network(_table(data, "network", where), "[network]"),
         image=_image(_table(data, "image", where), env, "[image]"),
         runtime=_runtime(_table(data, "runtime", where), env, "[runtime]"),
+        workspace=_workspace(_table(data, "workspace", where), env, "[workspace]"),
         skills=_skills(_table(data, "skills", where), paths.home, "[skills]"),
         modules=_modules(_table(data, "modules", where), "[modules]"),
         options=_options(_table(data, "options", where), "[options]"),

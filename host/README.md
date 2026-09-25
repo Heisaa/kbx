@@ -3,7 +3,7 @@
 | File | Purpose |
 | --- | --- |
 | `install.sh` | Checks the host and installs what is missing (pacman, apt, dnf, zypper; Kata from upstream) |
-| `spike.sh` | Checks the phase 0 risks R1–R7 on this host with throwaway containers |
+| `spike.sh` | Checks the phase 0 risks R1–R8 on this host with throwaway containers |
 | `kbx-firewall.sh` | Firewall rules (installed as `/usr/local/sbin/kbx-firewall`) |
 | `kbx-firewall.service` | systemd unit: after and part of `docker.service` |
 | `install-firewall` | Installs and starts the two above, writes `/etc/kbx/firewall.conf` |
@@ -23,6 +23,7 @@ Install steps: [docs/host-setup.md](../docs/host-setup.md).
 | DNS | `--dns 1.1.1.1 --dns 9.9.9.9`; kbx-init writes them to `resolv.conf` | Docker's embedded resolver is a host service, unreachable in the guest (R3) |
 | Home seeding | kbx-init copies `/opt/kbx/home-template` into a new volume | Works whether or not Docker's copy-up happens under Kata (R7) |
 | `/run` | `--tmpfs /run` | Readiness marker and dtach sockets are fresh on every start |
+| Workspace (mount mode) | the checkout as a plain bind mount at its own path; `agent` gets the host user's uid/gid; a host-side guard instead of read-only sub-mounts | Kata shares each bind mount with a non-recursive `MS_BIND`, so read-only sub-mounts made on the host do not reach the guest, and root in the guest can undo its own (R8 checks the write path and `docker pause`) |
 
 ## Spike results
 
@@ -42,6 +43,8 @@ R5   PASS  --memory 8g --cpus 4 → 5 cpus, 10179 MiB (Kata adds them on top of 
 R6   PASS  bare metal
 R7   PASS  copy-up works (5 entries). kbx-init copies the home template itself either way.
 ```
+
+R8 (mount mode) was added after this run; run `host/spike.sh` again to record it.
 
 What this decided (now kbx's defaults):
 

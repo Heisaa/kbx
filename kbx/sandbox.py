@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -20,6 +21,8 @@ from .paths import Paths
 HOME = "/home/agent"
 LABEL_PROJECT = "kbx.project"
 LABEL_NAME = "kbx.name"
+LABEL_WORKSPACE = "kbx.workspace"
+LABEL_GITDIR = "kbx.gitdir"
 READY_TIMEOUT = 600.0
 FIREWALL_PORT = 9  # discard: nothing should answer, and nothing may reach it
 
@@ -27,11 +30,30 @@ FIREWALL_PORT = 9  # discard: nothing should answer, and nothing may reach it
 DOCKER_VOLUME_TARGET = "/var/lib/kbx-docker"
 
 
+# Guest paths a mounted checkout may neither be nor sit under (nor contain).
+SYSTEM_PATHS = (
+    "/proc", "/sys", "/dev", "/run", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot",
+    "/opt/kbx", "/var/lib/docker", DOCKER_VOLUME_TARGET,
+)  # fmt: skip
+SYSTEM_PARENTS = ("/", "/home", HOME, "/opt", "/var", "/var/lib", "/root", "/tmp")
+
+
 @dataclass(frozen=True)
 class Sandbox:
     name: str
     project: str
     project_dir: Path
+    # "mount" (the host checkout, at the same path) or "clone" (see config.py).
+    mode: str = "clone"
+
+    @property
+    def clone_dir(self) -> str:
+        """Where clone mode keeps the sandbox's own clone (kept in the home volume)."""
+        return f"{HOME}/work/{self.project}"
+
+    @property
+    def workdir(self) -> str:
+        return str(self.project_dir) if self.mode == "mount" else self.clone_dir
 
     @property
     def home_volume(self) -> str:
@@ -41,10 +63,6 @@ class Sandbox:
     def docker_volume(self) -> str:
         return f"{self.name}-docker"
 
-    @property
-    def workdir(self) -> str:
-        return f"{HOME}/work/{self.project}"
-
 
 def sanitize(basename: str) -> str:
     text = basename.lower().replace("_", "-")
@@ -53,11 +71,85 @@ def sanitize(basename: str) -> str:
     return text or "project"
 
 
-def for_project(project_dir: Path) -> Sandbox:
+def for_project(project_dir: Path, mode: str = "clone") -> Sandbox:
     absolute = project_dir.resolve()
     project = sanitize(absolute.name)
     digest = hashlib.sha256(str(absolute).encode()).hexdigest()[:8]
-    return Sandbox(name=f"kbx-{project}-{digest}", project=project, project_dir=absolute)
+    return Sandbox(name=f"kbx-{project}-{digest}", project=project, project_dir=absolute, mode=mode)
+
+
+def _inside(parent: Path, path: Path) -> bool:
+    return path == parent or parent in path.parents
+
+
+def git_dirs(root: Path) -> tuple[Path, Path]:
+    """The checkout's git directory and the repository's common directory.
+
+    Both are `root/.git` for a main checkout. For a linked worktree `.git` is a
+    file pointing into the main repository's `.git/worktrees/`, whose
+    `commondir` leads back to that `.git`; a submodule checkout points into
+    `.git/modules/` of its superproject.
+    """
+    entry = root / ".git"
+    if entry.is_dir() and not entry.is_symlink():
+        return entry, entry
+    gitdir = None
+    if entry.is_file() and not entry.is_symlink():
+        text = entry.read_text(errors="replace").strip()
+        if text.startswith("gitdir:"):
+            gitdir = Path(os.path.normpath(root / text[len("gitdir:") :].strip()))
+    if gitdir is None or not (gitdir / "HEAD").is_file():
+        raise KbxError(f"{entry} does not lead to a git directory")
+    common = gitdir
+    commondir = gitdir / "commondir"
+    if commondir.is_file():
+        common = Path(os.path.normpath(gitdir / commondir.read_text(errors="replace").strip()))
+    if not common.is_dir():
+        raise KbxError(f"{gitdir}/commondir does not lead to a git directory")
+    return gitdir, common
+
+
+def shared_gitdir(sandbox: Sandbox) -> Path | None:
+    """Mount mode: the repository directory outside the checkout that is mounted too."""
+    _, common = git_dirs(sandbox.project_dir)
+    return None if _inside(sandbox.project_dir, common) else common
+
+
+def _check_path(text: str) -> None:
+    if any(c in text for c in ',"\n\\'):
+        raise KbxError(
+            f"{text!r} cannot be bind-mounted (comma, quote or newline in the path); use KBX_WORKSPACE=clone"
+        )
+    if text in SYSTEM_PARENTS or any(
+        text == p or text.startswith(p + "/") or p.startswith(text + "/") for p in SYSTEM_PATHS
+    ):
+        raise KbxError(
+            f"{text} would shadow system paths inside the sandbox; move the project or use KBX_WORKSPACE=clone"
+        )
+
+
+def check_mountable(sandbox: Sandbox) -> None:
+    """Mount mode: the checkout (and its repository directory, if that lies
+    elsewhere) at paths that shadow nothing in the guest."""
+    _check_path(str(sandbox.project_dir))
+    shared = shared_gitdir(sandbox)
+    if shared is not None:
+        _check_path(str(shared))
+
+
+def mounted_gitdir(docker: Docker, sandbox: Sandbox) -> str | None:
+    """The repository directory an existing mount-mode container mounts besides the checkout."""
+    data = docker.inspect("container", sandbox.name) or {}
+    return ((data.get("Config") or {}).get("Labels") or {}).get(LABEL_GITDIR)
+
+
+def workspace_mode(docker: Docker, sandbox: Sandbox) -> str | None:
+    """The mode an existing container was created with (None if there is none)."""
+    data = docker.inspect("container", sandbox.name)
+    if data is None:
+        return None
+    labels = (data.get("Config") or {}).get("Labels") or {}
+    return str(labels.get(LABEL_WORKSPACE) or "clone")  # containers from before mount mode
 
 
 def ensure_network(docker: Docker, config: Config) -> None:
@@ -106,7 +198,8 @@ def privilege_args(config: Config) -> list[str]:
 
 
 def create_args(sandbox: Sandbox, config: Config, paths: Paths) -> list[str]:
-    """`docker create` arguments. The stage is the only host path mounted."""
+    """`docker create` arguments. Host paths mounted: the stage (read-only) and,
+    in mount mode, the checkout at its own path."""
     args = [
         "create",
         "--name", sandbox.name,
@@ -127,8 +220,24 @@ def create_args(sandbox: Sandbox, config: Config, paths: Paths) -> list[str]:
         "-v", f"{sandbox.home_volume}:{HOME}",
         "-v", f"{sandbox.docker_volume}:{DOCKER_VOLUME_TARGET}",
         "--mount", f"type=bind,source={paths.stage},target=/opt/kbx/stage,readonly",
+    ]  # fmt: skip
+    if sandbox.mode == "mount":
+        # kbx-init gives `agent` these ids, so files keep their owner on both sides.
+        args += [
+            "--mount", f"type=bind,source={sandbox.project_dir},target={sandbox.project_dir}",
+            "-e", f"KBX_HOST_UID={os.getuid()}",
+            "-e", f"KBX_HOST_GID={os.getgid()}",
+        ]  # fmt: skip
+        shared = shared_gitdir(sandbox)
+        if shared is not None:
+            # A linked worktree: git inside needs the main repository's .git,
+            # at the path the worktree's .git file names. Only that directory:
+            # the main checkout's files stay out.
+            args += ["--mount", f"type=bind,source={shared},target={shared}", "--label", f"{LABEL_GITDIR}={shared}"]
+    args += [
         "--label", f"{LABEL_PROJECT}={sandbox.project_dir}",
         "--label", f"{LABEL_NAME}={sandbox.name}",
+        "--label", f"{LABEL_WORKSPACE}={sandbox.mode}",
         config.image.name,
     ]  # fmt: skip
     return args
@@ -180,6 +289,8 @@ def ensure_running(docker: Docker, sandbox: Sandbox, timeout: float = READY_TIME
     status = state(docker, sandbox)
     if status is None:
         raise KbxError(f"sandbox {sandbox.name} does not exist")
+    if status == "paused":
+        raise KbxError(paused_message(sandbox))
     if status != "running":
         print(f"→ Starting {sandbox.name}")
         docker.run(["start", sandbox.name])
@@ -263,8 +374,26 @@ def firewall_check(docker: Docker, sandbox: Sandbox, config: Config, env: dict[s
     )
 
 
+def paused_message(sandbox: Sandbox) -> str:
+    return (
+        f"sandbox {sandbox.name} is paused. The kbx guard pauses a sandbox when the agent changes "
+        "something host tools would run; `kbx resume` shows what happened and resumes it"
+    )
+
+
+def pause(docker: Docker, sandbox: Sandbox) -> bool:
+    """Freeze the sandbox; stop it if the runtime cannot pause. True if it is no longer running."""
+    if docker.ok(["pause", sandbox.name], timeout=60):
+        return True
+    return docker.ok(["stop", "-t", "5", sandbox.name], timeout=60)
+
+
 def stop(docker: Docker, sandbox: Sandbox) -> None:
-    if state(docker, sandbox) == "running":
+    status = state(docker, sandbox)
+    if status == "paused":
+        docker.run(["unpause", sandbox.name])
+        status = "running"
+    if status == "running":
         docker.run(["stop", sandbox.name], stdout=None)
 
 

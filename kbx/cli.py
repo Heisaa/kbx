@@ -8,10 +8,10 @@ import os
 import sys
 import traceback
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import __version__, agents, clipd, git, image, sandbox, session, stage
+from . import __version__, agents, clipd, git, guard, image, sandbox, session, stage
 from . import config as config_mod
 from . import modules as modules_mod
 from . import paths as paths_mod
@@ -28,9 +28,10 @@ USAGE = """\
 kbx claude|codex|pi [agent args…]   create/start the sandbox, update, attach
 kbx attach [claude|codex|pi]        reattach to a running session
 kbx shell                           bash in the sandbox (as agent)
-kbx start                           create/start the sandbox and seed the clone, no attach
-kbx fetch [branch…]                 sandbox branches → host refs/remotes/kbx/*
-kbx sync                            host branches → sandbox refs/remotes/host/*
+kbx start                           create/start the sandbox (and seed the clone), no attach
+kbx resume [--accept]               after the guard paused the sandbox: review, resume
+kbx fetch [branch…]                 clone mode: sandbox branches → host refs/remotes/kbx/*
+kbx sync                            clone mode: host branches → sandbox refs/remotes/host/*
 kbx update                          update all agents without launching
 kbx rc-start                        start Codex remote control without the TUI
 kbx logs                            startup, dockerd and module logs
@@ -69,30 +70,61 @@ def warn(message: str) -> None:
     print(f"⚠ {message}", file=sys.stderr)
 
 
-def current_sandbox(cwd: Path | None = None) -> Sandbox:
-    return sandbox.for_project(git.project_root(cwd or Path.cwd()))
+def current_sandbox(ctx: Context, cwd: Path | None = None) -> Sandbox:
+    """This project's sandbox, in the mode its container was created with."""
+    sb = sandbox.for_project(git.project_root(cwd or Path.cwd()), ctx.config.workspace.mode)
+    existing = sandbox.workspace_mode(ctx.docker, sb)
+    return sb if existing in (None, sb.mode) else replace(sb, mode=existing)
+
+
+def guarded(ctx: Context, sb: Sandbox) -> bool:
+    return sb.mode == "mount" and ctx.config.workspace.guard
 
 
 def prepare(ctx: Context, *, seed_clone: bool = True) -> Sandbox:
-    """Launch sequence steps 1-4: config, stage, create, start, firewall, seed."""
-    sb = current_sandbox()
+    """Launch sequence steps 1-4: config, stage, create, start, firewall, then
+    the guard (mount mode) or the clone (clone mode)."""
+    sb = current_sandbox(ctx)
+    if sb.mode != ctx.config.workspace.mode:
+        warn(
+            f"{sb.name} was created in {sb.mode} mode, but the config says {ctx.config.workspace.mode}; "
+            "`kbx recreate` switches (volumes are kept)"
+        )
     for message in image.drift(ctx.docker, ctx.paths, ctx.config, ctx.resolved):
         warn(message)
     for message in stage.build(ctx.paths, ctx.config, ctx.resolved):
         warn(message)
+    if sb.mode == "mount":
+        sandbox.check_mountable(sb)
+        shared = sandbox.shared_gitdir(sb)
+        exists = sandbox.state(ctx.docker, sb) is not None
+        if exists and sandbox.mounted_gitdir(ctx.docker, sb) != (str(shared) if shared else None):
+            warn("this worktree's repository directory changed since the sandbox was created; `kbx recreate` mounts it")
     sandbox.ensure_created(ctx.docker, sb, ctx.config, ctx.paths)
+    starting = sandbox.state(ctx.docker, sb) not in ("running", "paused")
+    if guarded(ctx, sb) and starting:
+        guard.before_start(ctx.paths, sb, ctx.config.workspace.protect)
     sandbox.ensure_running(ctx.docker, sb)
+    if guarded(ctx, sb):  # before anything below can fail and leave it unwatched
+        guard.ensure(ctx.paths, sb, ctx.docker, ENTRY, ctx.config.workspace.protect)
+    elif sb.mode == "mount":
+        warn("the kbx guard is off ([workspace] guard = false): the agent can plant git hooks the host runs")
     sandbox.firewall_check(ctx.docker, sb, ctx.config, dict(ctx.env))
-    if seed_clone and not git.is_seeded(ctx.docker, sb):
+    if sb.mode == "mount":
+        if starting:
+            git.write_mount_note(ctx.docker, sb)
+    elif seed_clone and not git.is_seeded(ctx.docker, sb):
         git.seed(ctx.docker, sb)
     return sb
 
 
 def existing_running(ctx: Context) -> Sandbox:
-    sb = current_sandbox()
+    sb = current_sandbox(ctx)
     status = sandbox.state(ctx.docker, sb)
     if status is None:
         raise KbxError("no sandbox for this project yet; start one with `kbx claude|codex|pi`")
+    if status == "paused":
+        raise KbxError(sandbox.paused_message(sb))
     if status != "running":
         raise KbxError(f"sandbox {sb.name} is {status}; start it with `kbx claude|codex|pi` or `kbx shell`")
     return sb
@@ -119,6 +151,8 @@ def _clipboard(ctx: Context, sb: Sandbox) -> None:
 
 def _attach(ctx: Context, sb: Sandbox, agent: str, inner: Sequence[str]) -> None:
     _clipboard(ctx, sb)
+    if guarded(ctx, sb):
+        guard.register_tty(ctx.paths, sb.name)
     host_env = dict(os.environ)
     host_env["HERDR_AGENT"] = agent  # Herdr sees `docker`, not the agent
     key = ctx.config.launcher.detach_key
@@ -168,6 +202,8 @@ def cmd_attach(ctx: Context, args: argparse.Namespace) -> int:
     if name not in live:
         raise KbxError(f"no running {name} session; start one with `kbx {name}`")
     sandbox.firewall_check(ctx.docker, sb, ctx.config, dict(ctx.env))
+    if guarded(ctx, sb):
+        guard.ensure(ctx.paths, sb, ctx.docker, ENTRY, ctx.config.workspace.protect)
     _attach(ctx, sb, name, session.dtach_attach(name, ctx.config.launcher.detach_key))
     return 0
 
@@ -175,6 +211,8 @@ def cmd_attach(ctx: Context, args: argparse.Namespace) -> int:
 def cmd_shell(ctx: Context, args: argparse.Namespace) -> int:
     sb = prepare(ctx)
     _clipboard(ctx, sb)
+    if guarded(ctx, sb):
+        guard.register_tty(ctx.paths, sb.name)
     session.exec_attach(
         ctx.docker,
         sb,
@@ -188,7 +226,31 @@ def cmd_shell(ctx: Context, args: argparse.Namespace) -> int:
 
 def cmd_start(ctx: Context, args: argparse.Namespace) -> int:
     sb = prepare(ctx)
-    print(f"✓ {sb.name} is running; clone at {sb.workdir}")
+    where = f"working in {sb.workdir}" if sb.mode == "mount" else f"clone at {sb.workdir}"
+    print(f"✓ {sb.name} is running; {where}")
+    return 0
+
+
+def cmd_resume(ctx: Context, args: argparse.Namespace) -> int:
+    sb = current_sandbox(ctx)
+    status = sandbox.state(ctx.docker, sb)
+    lines = guard.report(ctx.paths, sb)
+    if not lines and status != "paused":
+        print("Nothing to resume: the guard has not stopped anything.")
+        return 0
+    for line in lines:
+        print(line)
+    if lines:
+        accept = args.accept or _ask("Were these changes yours? Restore them", False)
+        for note in guard.resolve(ctx.paths, sb, ctx.config.workspace.protect, accept=accept):
+            print(f"  {note}")
+        if not accept:
+            print("Kept the neutralized versions; the agent's stay at the quarantine paths above.")
+    if status == "paused":
+        ctx.docker.run(["unpause", sb.name])
+    if status in ("running", "paused") and guarded(ctx, sb):
+        guard.ensure(ctx.paths, sb, ctx.docker, ENTRY, ctx.config.workspace.protect)
+    print(f"✓ {sb.name} " + ("resumed" if status == "paused" else "can start again"))
     return 0
 
 
@@ -206,9 +268,17 @@ def cmd_sync(ctx: Context, args: argparse.Namespace) -> int:
 
 def existing_or_start(ctx: Context) -> Sandbox:
     """Start an existing sandbox if needed (git commands never create one)."""
-    sb = current_sandbox()
-    if sandbox.state(ctx.docker, sb) is None:
+    sb = current_sandbox(ctx)
+    status = sandbox.state(ctx.docker, sb)
+    if status is None:
         raise KbxError("no sandbox for this project yet; start one with `kbx claude|codex|pi`")
+    if sb.mode == "mount":
+        # A clone left over from clone mode stays reachable while the sandbox runs.
+        if status != "running" or not git.is_seeded(ctx.docker, sb):
+            raise KbxError(
+                "not needed in mount mode: the sandbox works in your checkout, so commits show up on both sides"
+            )
+        return sb
     stage.build(ctx.paths, ctx.config, ctx.resolved)
     sandbox.ensure_running(ctx.docker, sb)
     if not git.is_seeded(ctx.docker, sb):
@@ -242,7 +312,7 @@ done
 
 
 def cmd_logs(ctx: Context, args: argparse.Namespace) -> int:
-    sb = current_sandbox()
+    sb = current_sandbox(ctx)
     status = sandbox.state(ctx.docker, sb)
     if status is None:
         raise KbxError("no sandbox for this project yet")
@@ -260,32 +330,47 @@ def cmd_logs(ctx: Context, args: argparse.Namespace) -> int:
         "  ~/.claude/debug/*.txt      (KBX_DEBUG=true kbx claude → claude --debug)\n"
         "  ~/.codex/log/              and `codex app-server daemon status`\n"
         f"Clipboard watcher (host): {ctx.paths.log_dir}/clipd-{sb.name}.log\n"
+        f"Guard (host, mount mode): {ctx.paths.log_dir}/guard-{sb.name}.log\n"
         "Host: journalctl -t kata (containerd shim), and firewall drop counters:\n"
         "  sudo iptables -vnL KBX-INPUT; sudo iptables -vnL KBX-FORWARD"
     )
     return 0
 
 
+def _stop(ctx: Context, sb: Sandbox) -> None:
+    sandbox.stop(ctx.docker, sb)
+    if guarded(ctx, sb):
+        actions = guard.Guard(ctx.paths, sb.name).seal()
+        if actions:
+            warn(f"the kbx guard neutralized {guard.summary(actions)}; `kbx resume` shows the details")
+
+
 def cmd_stop(ctx: Context, args: argparse.Namespace) -> int:
-    sb = current_sandbox()
+    sb = current_sandbox(ctx)
     if sandbox.state(ctx.docker, sb) is None:
         raise KbxError("no sandbox for this project")
-    sandbox.stop(ctx.docker, sb)
+    _stop(ctx, sb)
     print(f"✓ Stopped {sb.name}")
     return 0
 
 
 def cmd_recreate(ctx: Context, args: argparse.Namespace) -> int:
-    sb = current_sandbox()
+    sb = current_sandbox(ctx)
     if sandbox.state(ctx.docker, sb) is None:
         raise KbxError("no sandbox for this project")
     stage.build(ctx.paths, ctx.config, ctx.resolved)
     if ctx.docker.inspect("image", ctx.config.image.name) is None:
         raise KbxError(f"image {ctx.config.image.name!r} not found; run `kbx build` first")
-    sandbox.stop(ctx.docker, sb)
+    new = replace(sb, mode=ctx.config.workspace.mode)
+    if new.mode == "mount":
+        sandbox.check_mountable(new)
+    _stop(ctx, sb)
     sandbox.remove_container(ctx.docker, sb)
-    sandbox.ensure_created(ctx.docker, sb, ctx.config, ctx.paths)
-    print(f"✓ Recreated {sb.name} from {ctx.config.image.name}; volumes kept. It starts at the next launch.")
+    sandbox.ensure_created(ctx.docker, new, ctx.config, ctx.paths)
+    print(f"✓ Recreated {sb.name} from {ctx.config.image.name} in {new.mode} mode; volumes kept.")
+    if sb.mode == "clone" and new.mode == "mount":
+        print(f"  The old clone stays at {sb.clone_dir}; `kbx fetch` still reaches it while the sandbox runs.")
+    print("  It starts at the next launch.")
     return 0
 
 
@@ -301,14 +386,19 @@ def _ask(prompt: str, default: bool) -> bool:
 
 
 def cmd_rm(ctx: Context, args: argparse.Namespace) -> int:
-    sb = current_sandbox()
-    exists = sandbox.state(ctx.docker, sb) is not None
+    sb = current_sandbox(ctx)
+    status = sandbox.state(ctx.docker, sb)
+    exists = status is not None
     volumes = [v for v in (sb.home_volume, sb.docker_volume) if ctx.docker.inspect("volume", v)]
     if not exists and not volumes:
         print(f"Nothing to remove for {sb.project_dir}.")
         return 0
     inspected = False
-    if exists:
+    if exists and sb.mode == "mount" and (status != "running" or not git.is_seeded(ctx.docker, sb)):
+        # The work is in the checkout; only an old clone from clone mode could hold more.
+        print(f"Your checkout {sb.project_dir} is not touched.")
+        inspected = True
+    elif exists:
         try:
             stage.build(ctx.paths, ctx.config, ctx.resolved)
             sandbox.ensure_running(ctx.docker, sb, timeout=180)
@@ -338,6 +428,7 @@ def cmd_rm(ctx: Context, args: argparse.Namespace) -> int:
         return 1
     sandbox.remove_container(ctx.docker, sb)
     sandbox.remove_volumes(ctx.docker, sb)
+    guard.remove(ctx.paths, sb.name)
     print(f"✓ Removed {sb.name}")
     return 0
 
@@ -430,6 +521,8 @@ def parser() -> argparse.ArgumentParser:
     attach.add_argument("agent", nargs="?", choices=list(agents.AGENTS))
     sub.add_parser("shell", help="bash in the sandbox")
     sub.add_parser("start", help="create/start the sandbox without attaching")
+    resume = sub.add_parser("resume", help="review what the guard stopped and resume the sandbox")
+    resume.add_argument("--accept", action="store_true", help="take the agent's quarantined versions back")
     fetch = sub.add_parser("fetch", help="sandbox branches → host refs/remotes/kbx/*")
     fetch.add_argument("branches", nargs="*")
     sub.add_parser("sync", help="host branches → sandbox refs/remotes/host/*")
@@ -461,6 +554,7 @@ COMMANDS = {
     "attach": cmd_attach,
     "shell": cmd_shell,
     "start": cmd_start,
+    "resume": cmd_resume,
     "fetch": cmd_fetch,
     "sync": cmd_sync,
     "update": cmd_update,
@@ -481,6 +575,8 @@ def dispatch(argv: Sequence[str], env: Mapping[str, str]) -> int:
         return cmd_agent(Context.load(env), argv[0], argv[1:])
     if argv and argv[0] == "_clipd" and len(argv) == 2:
         return clipd.run(paths_mod.resolve(env), argv[1])
+    if argv and argv[0] == "_guard" and len(argv) == 2:
+        return guard.run(paths_mod.resolve(env), argv[1])
     args = parser().parse_args(argv)
     if args.command is None:
         parser().print_help()

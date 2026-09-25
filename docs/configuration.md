@@ -15,8 +15,9 @@ run `kbx check` after editing.
 | config | `$XDG_CONFIG_HOME/kbx/config.toml` (`~/.config/kbx/`) |
 | user modules | `$XDG_CONFIG_HOME/kbx/modules/<name>/` |
 | stage (mounted read-only into sandboxes) | `$XDG_DATA_HOME/kbx/stage/` (`~/.local/share/kbx/`) |
-| logs (clipboard watcher) | `$XDG_DATA_HOME/kbx/log/` |
-| runtime (clipd pidfiles) | `$XDG_RUNTIME_DIR/kbx/` |
+| logs (clipboard watcher, guard) | `$XDG_DATA_HOME/kbx/log/` |
+| guard baselines, trusted copies, quarantine | `$XDG_DATA_HOME/kbx/guard/<sandbox>/` |
+| runtime (clipd and guard pidfiles) | `$XDG_RUNTIME_DIR/kbx/` |
 | built-in modules | `<checkout>/modules/`, found relative to the resolved `bin/kbx` |
 
 ## `[launcher]`
@@ -53,6 +54,16 @@ Each can be overridden for one run with `KBX_<NAME>`, e.g.
 | `runtime.privileges` | `"caps"` | Explicit capabilities for the inner dockerd. `"privileged"` does not work under Kata 4 (its agent cannot recreate the host device list), but does under `runc` (risk R1) |
 | `runtime.docker_storage` | `"loop"` | A sparse ext4 image on the volume, loop-mounted as dockerd's data root (overlayfs cannot use Kata's virtio-fs volume as its upper layer). `"volume"` uses the volume directly, which works under `runc` (risk R2) |
 
+## `[workspace]`
+
+| Setting | Default | |
+| --- | --- | --- |
+| `mode` | `"mount"` | `"mount"`: the checkout is mounted at its own path; you and the agent share it. `"clone"`: a private clone, git crosses as bundles (`kbx fetch`/`sync`). Applied at create; `kbx recreate` switches. `KBX_WORKSPACE` overrides |
+| `guard` | `true` | Mount mode: the host-side guard that reverts agent changes to git hooks, git config and `protect` paths, and pauses the sandbox. `KBX_GUARD` overrides |
+| `protect` | hook-framework and editor files | Paths relative to the project (files or directories) guarded like hooks. The default list: `.husky`, `.githooks`, `.lefthook`, `.pre-commit-config.yaml`/`.yml`, `lefthook.yml`/`.yaml` and their dotted and `-local` variants, `.vscode/settings.json`, `.vscode/tasks.json`. Setting it replaces the list. Takes effect at the next start |
+
+See [git-workflow.md](git-workflow.md) for what each mode means in practice.
+
 ## `[skills]`
 
 ```toml
@@ -87,6 +98,7 @@ before anything runs. See [modules.md](modules.md).
 | --- | --- |
 | `KBX_<LAUNCHER_SETTING>` | Per-run override of a `[launcher]` setting |
 | `KBX_IMAGE`, `KBX_RUNTIME` | Per-run image and runtime name |
+| `KBX_WORKSPACE`, `KBX_GUARD` | Per-run `[workspace] mode` and `guard` (the mode only matters when the sandbox is created) |
 | `KBX_DEBUG=1` | Tracebacks for errors, and `claude --debug` |
 | `KBX_DOCKER` | Path or name of the docker CLI |
 | `KBX_UNSAFE_NO_FIREWALL_CHECK=1` | Skip the launch-time firewall check. Only for development with `runc` on a machine without the firewall |
@@ -97,5 +109,6 @@ before anything runs. See [modules.md](modules.md).
 | --- | --- |
 | Seeds (`home/`), services, `start.sh`, skills, options used at start | Next sandbox start; agent-specific seeds before each launch of that agent |
 | A module's `build.sh` or build options, enabling a module with `build.sh` | `kbx build && kbx recreate` (kbx warns at launch) |
-| `memory`, `cpus`, `dns`, runtime, network | `kbx recreate` |
+| `memory`, `cpus`, `dns`, runtime, network, `[workspace] mode` | `kbx recreate` |
+| `[workspace] protect` | Next sandbox start |
 | `auto_update`, `remote_control`, `detach_key`, `debug` | Next launch |

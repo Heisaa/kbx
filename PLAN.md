@@ -8,9 +8,12 @@ agent work autonomously on a project without giving it access to the rest of
 their machine: SSH keys, cloud credentials, browser data, other projects, or
 services on the host and LAN.
 
-Each project gets its own lightweight VM (Kata Containers) with the agents,
-a full Docker engine and a private git clone. The agent works freely inside.
-The developer reviews the resulting branches on the host and pushes them.
+Each project gets its own lightweight VM (Kata Containers) with the agents
+and a full Docker engine. By default the project checkout is mounted into it,
+so the developer and the agent both edit and commit in the same repository; a
+host-side guard keeps the agent from planting code that host tools run. A
+stricter clone mode gives the sandbox a private clone instead, and git crosses
+only as bundles. The developer pushes from the host either way.
 
 - **For:** individual developers on Linux who use terminal coding agents.
   v1 supports Claude Code, Codex and pi, including Claude and Codex remote
@@ -33,8 +36,9 @@ each user's own config directory (see [Shareability](#shareability)).
    `$HOME`, and no network path to the host or LAN.
 2. **Remote control must work** for Claude Code and Codex.
 3. **Agents:** Claude Code, Codex and pi.
-4. **Git lives inside the sandbox.** Agents commit, branch, rebase and use
-   worktrees locally. The host fetches the results and pushes itself.
+4. **Git works on both sides.** In mount mode (default) the agent and the
+   developer commit in the same checkout. In clone mode the agent commits in a
+   private clone and the host fetches the results. The host pushes itself.
 5. **Docker works inside the sandbox.**
 6. **Image paste works in all three agents.**
 7. **Extensible through modules.** Generic features ship as built-in modules.
@@ -55,7 +59,7 @@ a decision before it is added.
   host is injected.
 - Git credentials or `gh` auth inside the sandbox. The agent cannot push.
 - Presets (`personal`/`minimal`) and pinned release mode.
-- Host-mounted workspace, and clone mode with a git-daemon.
+- sbx's clone mode with a git-daemon (kbx's clone mode uses bundles).
 - Port publishing helpers. Use `docker` flags manually if needed.
 - Compatibility with sbx's kit format (YAML specs, args templating,
   create-time snapshot). kbx has its own simpler module format (phase 4) and
@@ -67,7 +71,7 @@ a decision before it is added.
 | --- | --- |
 | Runtime | Kata Containers (needed for Docker-in-sandbox with a separate kernel) |
 | Network | Full internet; no host, LAN, link-local or metadata access |
-| Git | Clone lives in the sandbox; host fetches via bundle and pushes |
+| Workspace | Mount mode (default): the checkout at its own path, guarded from the host. Clone mode: a private clone, bundles in and out |
 | Granularity | One sandbox per project; claude, codex and pi installed in the same sandbox and sharing the clone |
 | Sessions | Detach/reattach without tmux keybindings (see [Sessions](#sessions-detach-without-tmux)) |
 | Features | Image paste (**all three agents**), optional Playwright + Chromium, `HERDR_AGENT` hint for Herdr users |
@@ -88,8 +92,9 @@ sandbox user, including root inside the VM (it has Docker).
 | --- | --- |
 | SSH keys, `~/.ssh/config`, ssh-agent socket | Not mounted, no `SSH_AUTH_SOCK`, no host network path |
 | Other host secrets (`~/.aws`, `gh` token, `.env` files, browser data) | Nothing from `$HOME` is mounted except a read-only skills copy |
-| Host shell config (passphrase capture via `.bashrc`/`PATH`) | No write access to any host path |
-| Host execution through git (hooks, `core.fsmonitor`, `core.sshCommand`, filters) | Host never runs git in an agent-written `.git`; it only fetches bundle data into its own clone |
+| Host shell config (passphrase capture via `.bashrc`/`PATH`) | No write access to any host path outside the checkout (mount mode) |
+| Host execution through git (hooks, `core.fsmonitor`, `core.sshCommand`, filters, `commondir`) | Mount mode: the guard reverts such changes as they happen and pauses the sandbox (see [Workspace](#workspace-mount-mode-and-the-guard)). Clone mode: the host never runs git in an agent-written `.git`; it only fetches bundle data |
+| Hook-framework and editor files (`.husky/`, `.pre-commit-config.yaml`, `lefthook.yml`, `.vscode/settings.json`) | Mount mode: guarded like hooks (`[workspace] protect`). Clone mode: review them in the diff |
 | Host kernel | Separate guest kernel (Kata VM) |
 | Host services (localhost ports, Docker socket, LAN, router, VPN) | Host firewall drops everything from the sandbox bridge to host and private ranges |
 
@@ -100,10 +105,18 @@ sandbox user, including root inside the VM (it has Docker).
   matters.
 - Open internet allows data exfiltration of the project source.
 - **Code the agent wrote is untrusted.** Running `npm test`, `make` or the app
-  on the host after fetching throws away the isolation. Run and test inside
-  the sandbox; on the host, review diffs before running anything.
+  on the host throws away the isolation. In mount mode the agent's edits land
+  in your checkout as it makes them, so review `git diff` before running
+  anything on the host; run and test inside the sandbox.
+- **Mount mode shares the whole checkout**, untracked files included: the
+  agent can read `.env` files in it (and send them out), and a crafted file can
+  target a host tool the guard does not know. The guard is a watcher, not a
+  wall: between the agent's write and its repair there are milliseconds, and it
+  only protects while it runs (kbx starts it with the sandbox and checks for
+  missed changes before trusting a new baseline). Use clone mode where that is
+  not enough.
 - **Pushing from the host with a normal checkout** (a deliberate design
-  choice: users keep their usual git workflow and tooling). Hook
+  choice: users keep their usual git workflow and tooling). In clone mode, hook
   scripts that live in the repo run on the host when you commit or push after
   merging agent changes: husky (`core.hooksPath=.husky`), the pre-commit
   framework's `.pre-commit-config.yaml`, or `lefthook.yml`. So can other tools
@@ -131,8 +144,10 @@ host
 │               kbx-<id>-home    → /home/agent        (logins, agent config, git clone)
 │               kbx-<id>-docker  → /var/lib/docker    (inner docker; see risk R2)
 │               stage  (ro bind) → /opt/kbx/stage (modules, config, skills)
+│               checkout (bind)  → same path          (mount mode only)
 ├── nftables/iptables: kbx-firewall (drop sandbox → host / private ranges)
 ├── kbx launcher (Python)
+├── kbx-guard (mount mode, while the sandbox runs: reverts planted hooks/config, pauses)
 └── kbx-clipd (while attached: pushes clipboard images / clears into the sandbox)
 ```
 
@@ -340,7 +355,8 @@ self-location. Internal modules:
 | `stage.py` | build the stage (`cp -rL` equivalent, `config.json`, skills) by syncing in place, file by file; never replace a directory (bind-mount pinning) |
 | `image.py` | generate the Dockerfile from core + module layers, compute the module hash, `kbx build` |
 | `sandbox.py` | naming, create/start/stop/recreate/rm, readiness wait |
-| `git.py` | seed, `sync`, `fetch` via bundles (phase 3) |
+| `git.py` | clone mode: seed, `sync`, `fetch` via bundles (phase 3) |
+| `guard.py` | mount mode: host-side guard of `.git` and protected files (see [Workspace](#workspace-mount-mode-and-the-guard)) |
 | `agents.py` | per-agent prelaunch and argv (remote control, Codex auth/search, update commands) |
 | `session.py` | dtach command lines and the final `execvpe` attach |
 | `clipd.py` | host clipboard watcher (spawned in the background, reference-counted per sandbox) |
@@ -352,8 +368,9 @@ self-location. Internal modules:
 kbx claude|codex|pi [agent args…]   create/start sandbox, sync skills, update, attach
 kbx attach [claude|codex|pi]        reattach to a running session
 kbx shell                           bash in the sandbox (as agent)
-kbx fetch [branch…]                 sandbox branches → host refs/remotes/kbx/*
-kbx sync                            host branches → sandbox refs/remotes/host/*
+kbx resume [--accept]               after the guard paused the sandbox: review, resume
+kbx fetch [branch…]                 clone mode: sandbox branches → host refs/remotes/kbx/*
+kbx sync                            clone mode: host branches → sandbox refs/remotes/host/*
 kbx update                          update all agents without launching
 kbx logs                            startup log, dockerd log, agent debug log paths
 kbx stop | recreate | rm            lifecycle (rm lists unfetched branches and asks before deleting volumes)
@@ -387,13 +404,18 @@ docker create \
   "$IMAGE"
 ```
 
-The stage path on the host is fixed (`~/.local/share/kbx/stage`), and it is
-the **only** bind mount. A bind mount pins the directory inode it was created
+Mount mode adds `--mount type=bind,source=$PROJECT_DIR,target=$PROJECT_DIR`,
+`-e KBX_HOST_UID=… -e KBX_HOST_GID=…` and `--label kbx.workspace=mount`. For a
+linked worktree it also mounts the repository's common `.git` directory at its
+own path (`--label kbx.gitdir=…`).
+
+The stage path on the host is fixed (`~/.local/share/kbx/stage`), and besides
+the checkout in mount mode it is the **only** bind mount. A bind mount pins the directory inode it was created
 with, so restaging never replaces the stage root or any directory inside it.
 It syncs file by file in place: write each changed file to a temp name in the
 same directory and rename it over the old one, then delete files that are
 gone. An existing container therefore sees new contents without being
-recreated. Mount nothing else. In particular: no project dir, no `$HOME` paths, no
+recreated. Mount nothing else. In particular: no other `$HOME` paths, no
 `/var/run/docker.sock`, no `SSH_AUTH_SOCK`, and no `--env-file`.
 
 `SANDBOX_NAME` is set so the Claude statusline keeps showing the sandbox name.
@@ -403,14 +425,17 @@ recreated. Mount nothing else. In particular: no project dir, no `$HOME` paths, 
 1. Load `~/.config/kbx/config.toml` with env overrides, validate it, and
    compare the image's module hash (drift warning).
 2. Rebuild the stage (phase 4) and create the container if it is missing.
-3. Start the container if it is stopped, then wait for readiness.
+3. Mount mode, if the container is stopped: the guard checks an unsealed
+   state, then takes its baseline.
+   Start the container if it is stopped, then wait for readiness.
    **Firewall check** (fail closed): from inside the sandbox, connect to the
    bridge gateway (from the configured subnet, `172.30.0.1` by default) on an unused port with a 2 s timeout. A timeout
    means the packet was dropped (firewall up). A connection refused/reset
    means the host answered (firewall missing), and kbx refuses to attach and
    prints how to start `kbx-firewall.service`. This runs on every launch and
    attach, because the rules can vanish after a reboot or a Docker restart.
-4. First run only: seed the git clone (phase 3).
+4. Mount mode: make sure the guard runs (checking first if it did not).
+   Clone mode, first run only: seed the git clone (phase 3).
 5. **If a session for this agent is already running** (its dtach socket
    exists and has a live master), skip steps 6–7 and attach to it directly
    (step 8). The binary is never updated under a live session, and its remote
@@ -445,7 +470,55 @@ skipped if missing).
 
 ---
 
-## Phase 3: git in and out
+## Workspace: mount mode and the guard
+
+`[workspace] mode = "mount"` (default) bind-mounts the checkout into the
+sandbox **at its own path**, so absolute paths (virtualenvs, build caches,
+error messages, `docker run -v $PWD:…` inside) mean the same on both sides.
+`kbx-init` gives `agent` the host user's uid/gid, so files keep their owner.
+Both sides edit, stage and commit in the one repository; nothing needs
+fetching. For a linked worktree (whose `.git` is a file pointing into the main
+repository's `.git/worktrees/`), kbx also mounts the repository's common
+directory at its own path, and the guard checks that the `.git` file still
+points there. Clone mode (below) remains for projects that want the stricter
+model.
+
+**The problem.** The agent can now write `.git`, and the host runs git in it:
+`core.fsmonitor` runs on every `git status` (editors poll it), hooks on every
+commit, and a `.git/commondir` file makes git read another directory's config.
+Hook frameworks (husky, pre-commit, lefthook) run in-tree files, and editors
+act on their workspace settings.
+
+**Why not read-only mounts.** The agent is root in the guest with
+`CAP_SYS_ADMIN` (for the inner dockerd), so a read-only overlay inside the VM
+can simply be unmounted. A read-only sub-mount made on the host does not help
+either: Kata shares each bind mount into the VM with a plain, non-recursive
+`MS_BIND` (see `bindMount` in Kata's `mount_linux.go`), so the guest sees the
+files underneath, writable. No layout of `.git` fixes this: git needs to create
+and rename files at the top of `.git`, right next to `config` and `commondir`.
+
+**The guard** (`kbx/guard.py`) watches from the host instead, with inotify
+(polling every second as a fallback), in the checkout's `.git`, its submodules
+and worktrees, and repositories nested in the tree (searched every minute):
+
+- config entries outside a known-safe list (no key that runs a program, reads
+  another file as config, or points git elsewhere), new since the baseline,
+- hooks, the in-tree `core.hooksPath` directory and `[workspace] protect`,
+- `commondir` files that point anywhere but their own repository.
+
+On a finding it neutralizes first (the agent's version goes to quarantine
+under `$XDG_DATA_HOME/kbx/guard/<name>/`, the trusted one comes back), then
+runs `docker pause`, writes a note to attached terminals and sends a desktop
+notification. `kbx resume` shows the diffs and resumes; `--accept` takes the
+changes back (for example a hook the user installed on purpose).
+
+**Baseline.** Taken at every start, while no agent can run, so whatever the
+user changes while the sandbox is stopped is trusted. When the sandbox stops,
+the guard checks once more and seals the state. Without a seal (the guard died,
+the host rebooted), the next start checks the old baseline before trusting the
+new one, and refuses to start on findings until `kbx resume`.
+
+## Phase 3: git in and out (clone mode)
 
 The rule: **the host never runs git against a repository the agent can
 write.** The sandbox clone lives only in the `home` volume, and only bundle
@@ -1048,7 +1121,7 @@ kbx/                        # its own repository; clone anywhere
 ├── pyproject.toml          # tool config only (ruff, pyright); nothing to install
 ├── kbx/                    # host package (stdlib only)
 │   ├── cli.py  config.py  modules.py  stage.py  image.py  paths.py (XDG)
-│   ├── sandbox.py  git.py  agents.py  session.py  clipd.py
+│   ├── sandbox.py  git.py  guard.py  agents.py  session.py  clipd.py
 │   └── docker.py
 ├── kbx_sandbox/            # sandbox package (copied into the image)
 │   ├── init.py             # kbx-init: seed, start.sh, supervisor, ready marker

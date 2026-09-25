@@ -47,6 +47,16 @@
 # privileges = "caps"         # "privileged" fails under Kata 4 (risk R1)
 # docker_storage = "loop"     # or "volume" (runc only: overlayfs fails on virtio-fs) (risk R2)
 
+[workspace]
+# mode = "mount"              # the checkout is shared; "clone" keeps a private clone
+#                             # (bundles in and out). `kbx recreate` switches.
+# guard = true                # mount mode: revert planted git hooks/config, pause
+# protect = [".husky", ".githooks", ".lefthook", ".pre-commit-config.yaml",
+#   ".pre-commit-config.yml", "lefthook.yml", "lefthook.yaml", ".lefthook.yml",
+#   ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml",
+#   ".lefthook-local.yml", ".lefthook-local.yaml", ".vscode/settings.json",
+#   ".vscode/tasks.json"]      # files host tools run, guarded like hooks
+
 [skills]
 # Directories whose entries are skills; the first source wins on a name clash.
 # Missing directories are skipped.

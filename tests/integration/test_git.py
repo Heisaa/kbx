@@ -1,4 +1,4 @@
-"""Git through bundles against a real sandbox, including the malicious-repo test."""
+"""Clone mode: git through bundles against a real sandbox, including the malicious-repo test."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from tests.integration.base import SandboxCase
 
 
 class GitIntegrationTest(SandboxCase):
+    config_text = '[workspace]\nmode = "clone"\n'
+
     def test_fetch_and_malicious_config(self) -> None:
         clone = "~/work/inttest"
         self.out(

@@ -2,20 +2,23 @@
 
 **Self-hosted sandboxes for AI coding agents on a Linux workstation.** Each
 project gets its own lightweight VM ([Kata Containers](https://katacontainers.io))
-with Claude Code, Codex and pi installed, a full Docker engine and a private git
-clone. The agent works freely inside. You review its branches on the host and
-push them yourself.
+with Claude Code, Codex and pi installed and a full Docker engine. Your checkout
+is mounted into it: you and the agent edit and commit in the same repository,
+and you push from the host yourself.
 
-Nothing from your machine goes in: no SSH keys or agent socket, no cloud
-credentials or tokens, no `$HOME`, no project mount, and no network path to the
-host or your LAN. The internet stays open.
+Nothing else from your machine goes in: no SSH keys or agent socket, no cloud
+credentials or tokens, no other part of `$HOME`, and no network path to the host
+or your LAN. The internet stays open. A guard on the host keeps the agent from
+planting git hooks, git config or hook-framework files that your own tools
+would run. A stricter clone mode keeps the checkout out of the sandbox entirely.
 
 - **For:** individual developers on Linux (KVM required) who use terminal coding
   agents, including Claude and Codex remote control.
 - **Not for:** multi-user hosting, macOS/Windows hosts, or per-domain egress
   control.
-- kbx is independent of Docker Sandboxes (`sbx`): similar idea, fully
-  open-source stack, no egress proxy or credential injection.
+- kbx is independent of Docker Sandboxes (`sbx`): similar idea and the same
+  shared-checkout workflow, fully open-source stack, no egress proxy or
+  credential injection.
 
 ## Quick start
 
@@ -33,20 +36,22 @@ cd ~/code/myproject                           # any git repo with a commit
 kbx claude                                    # or: kbx codex, kbx pi
 ```
 
-The first run creates the sandbox, clones the project into it from a git bundle
+The first run creates the sandbox with your checkout mounted at the same path
 and attaches. Log in once inside (`/login` in Claude, `codex login
 --device-auth` in `kbx shell`); logins persist in the sandbox's home volume.
 
 Detach with `Ctrl-\` (configurable). The agent keeps running, and so does
 remote control. `kbx claude` or `kbx attach` reattaches.
 
-When the agent has committed work:
+The agent's edits and commits show up in your checkout as it makes them, and
+yours show up in the sandbox. Review with `git diff` / `git log -p` before you
+run anything on the host, then push as usual.
 
-```sh
-kbx fetch                          # sandbox branches → refs/remotes/kbx/*
-git log -p main..kbx/<branch>      # review on the host
-git merge kbx/<branch> && git push # from your own clone, as usual
-```
+If the agent changes something your tools would run (a git hook, `core.fsmonitor`
+or other git config, `.husky/`, `.pre-commit-config.yaml`, `.vscode/settings.json`),
+the guard puts the trusted version back, pauses the sandbox and tells you.
+`kbx resume` shows the diff and resumes it; `kbx resume --accept` takes the
+change back if it was yours. See [docs/git-workflow.md](docs/git-workflow.md).
 
 ## Commands
 
@@ -55,13 +60,14 @@ git merge kbx/<branch> && git push # from your own clone, as usual
 | `kbx claude\|codex\|pi [args…]` | create/start the sandbox, update the agent, attach (reattach if running) |
 | `kbx attach [agent]` | reattach to a running session |
 | `kbx shell` | bash in the sandbox, as `agent` |
-| `kbx start` | create/start the sandbox and seed the clone without attaching |
-| `kbx fetch [branch…]` | sandbox branches → host `refs/remotes/kbx/*` |
-| `kbx sync` | host branches → sandbox `refs/remotes/host/*` |
+| `kbx start` | create/start the sandbox without attaching |
+| `kbx resume [--accept]` | after the guard paused the sandbox: show what it stopped, resume |
+| `kbx fetch [branch…]` | clone mode: sandbox branches → host `refs/remotes/kbx/*` |
+| `kbx sync` | clone mode: host branches → sandbox `refs/remotes/host/*` |
 | `kbx update` | update all agents now |
 | `kbx rc-start` | start Codex remote control without the TUI |
 | `kbx logs` | startup, dockerd and module logs |
-| `kbx stop` / `recreate` / `rm` | lifecycle; `recreate` keeps volumes, `rm` lists unfetched work and asks |
+| `kbx stop` / `recreate` / `rm` | lifecycle; `recreate` keeps volumes (and switches mode), `rm` asks (clone mode: lists unfetched work) |
 | `kbx build` | build the image from core + enabled modules |
 | `kbx check` | validate config and modules |
 | `kbx seed [--dry-run\|--status\|--reset M]` | manage home defaults |
@@ -71,24 +77,28 @@ git merge kbx/<branch> && git push # from your own clone, as usual
 
 The assumed attacker is the agent itself, turned by prompt injection. It is
 root inside its VM. kbx protects your host: separate guest kernel, nothing of
-yours mounted, a firewall that drops everything from the sandbox bridge to the
-host and private ranges, and git that only crosses as bundle data (the host
-never runs git in a repository the agent can write).
+yours mounted but the checkout, a firewall that drops everything from the
+sandbox bridge to the host and private ranges, and the guard, which reverts
+changes to what host tools run from the repository (git hooks and config,
+`commondir`, hook-framework and editor files, also in submodules and nested
+repositories) and pauses the sandbox.
 
 Accepted risks: logins inside the sandbox can be stolen (use a separate account
 or a spend-limited key); the open internet allows exfiltration of the project
-source; **code the agent wrote is untrusted** (run it in the sandbox, not on the
-host); repo-defined hooks (husky, pre-commit, lefthook) run on the host when you
-commit or push after merging, so review changes to them; and while you are
-attached, images you copy on the host are pushed into that sandbox for pasting.
-Full details: [PLAN.md](PLAN.md#threat-model).
+source, **including untracked files like `.env`** in mount mode; **code the
+agent wrote is untrusted** (run it in the sandbox, not on the host); the guard
+reacts within milliseconds but does not block the write itself, and only
+protects while it runs; and while you are attached, images you copy on the host
+are pushed into that sandbox for pasting. Clone mode (`[workspace] mode =
+"clone"`) keeps the checkout out entirely and git crosses only as bundles. Full
+details: [PLAN.md](PLAN.md#threat-model).
 
 ## Documentation
 
 - [docs/host-setup.md](docs/host-setup.md): Kata, Docker runtime, firewall, spike checks
 - [docs/configuration.md](docs/configuration.md): `~/.config/kbx/config.toml`
 - [docs/modules.md](docs/modules.md): module format, seeds, writing your own
-- [docs/git-workflow.md](docs/git-workflow.md): seeding, fetch/sync, worktrees
+- [docs/git-workflow.md](docs/git-workflow.md): mount mode and the guard, clone mode (fetch/sync), worktrees
 - [docs/migrating-from-sbx.md](docs/migrating-from-sbx.md): coming from Docker Sandboxes kits
 - [PLAN.md](PLAN.md): design and rationale
 

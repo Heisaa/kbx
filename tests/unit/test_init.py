@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from kbx import clipd, paths
@@ -119,3 +120,40 @@ class ClipdRegistrationTest(unittest.TestCase):
     def test_backend_detection(self) -> None:
         self.assertIsNone(clipd.backend({}))
         self.assertIn("wl-clipboard", clipd.missing_tools_hint({"WAYLAND_DISPLAY": "wayland-0"}))
+
+
+class RemapTest(unittest.TestCase):
+    def remap(self, env: dict[str, str], taken: tuple[bool, bool] = (False, False)) -> list[list[str]]:
+        calls: list[list[str]] = []
+        agent = pwd.struct_passwd(("agent", "x", 1000, 1000, "", "/home/agent", "/bin/bash"))
+
+        def lookup(kind: str, taken_here: bool) -> Any:
+            def find(_: int) -> Any:
+                if taken_here:
+                    return mock.Mock(pw_name="other", gr_name="other")
+                raise KeyError(kind)
+
+            return find
+
+        with (
+            mock.patch.object(init, "log", lambda message: None),
+            mock.patch.object(init.pwd, "getpwnam", return_value=agent),
+            mock.patch.object(init.pwd, "getpwuid", lookup("uid", taken[0])),
+            mock.patch.object(init.grp, "getgrgid", lookup("gid", taken[1])),
+            mock.patch.object(init.subprocess, "run", lambda argv, **_: calls.append(argv)),
+        ):
+            init.remap_agent(env)
+        return calls
+
+    def test_no_ids_or_same_ids(self) -> None:
+        self.assertEqual(self.remap({}), [])
+        self.assertEqual(self.remap({"KBX_HOST_UID": "1000", "KBX_HOST_GID": "1000"}), [])
+
+    def test_new_ids(self) -> None:
+        calls = self.remap({"KBX_HOST_UID": "1234", "KBX_HOST_GID": "1500"})
+        self.assertEqual(calls[0], ["groupmod", "-g", "1500", "agent"])
+        self.assertEqual(calls[1], ["usermod", "-u", "1234", "-g", "1500", "agent"])
+        self.assertIn(["chown", "-R", "-h", "--from=1000:1000", "1234:1500", "/home/agent"], calls)
+
+    def test_ids_taken_in_the_image_are_kept(self) -> None:
+        self.assertEqual(self.remap({"KBX_HOST_UID": "999", "KBX_HOST_GID": "999"}, taken=(True, True)), [])

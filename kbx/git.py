@@ -1,8 +1,11 @@
-"""Git in and out of the sandbox, through bundles only.
+"""Clone mode: git in and out of the sandbox, through bundles only.
 
 The rule: the host never runs git against a repository the agent can write.
 The host runs git only in its own clone (`git -C <project>`); the sandbox
 clone lives in the home volume, and only bundle data crosses the boundary.
+
+Mount mode shares the checkout instead (kbx/guard.py protects the host's git);
+only `project_root` and the agent note are used there.
 """
 
 from __future__ import annotations
@@ -86,7 +89,7 @@ def _strip_credentials(url: str) -> str:
 
 
 def is_seeded(docker: Docker, sandbox: Sandbox) -> bool:
-    result = docker.exec(sandbox.name, ["test", "-d", f"{sandbox.workdir}/.git"], check=False)
+    result = docker.exec(sandbox.name, ["test", "-d", f"{sandbox.clone_dir}/.git"], check=False)
     return result.returncode == 0
 
 
@@ -118,7 +121,7 @@ def seed(docker: Docker, sandbox: Sandbox) -> None:
     assert bundle.stdout is not None
     result = docker.exec(
         sandbox.name,
-        ["sh", "-c", SEED_SCRIPT, "sh", sandbox.workdir, HOST_BUNDLE],
+        ["sh", "-c", SEED_SCRIPT, "sh", sandbox.clone_dir, HOST_BUNDLE],
         stdin=bundle.stdout,
         check=False,
     )
@@ -134,15 +137,40 @@ def seed(docker: Docker, sandbox: Sandbox) -> None:
             docker.exec(sandbox.name, ["git", "config", "--global", key, value])
     upstream = _strip_credentials(host_git(root, "remote", "get-url", "origin", check=False).stdout.strip())
     if upstream:
-        docker.exec(sandbox.name, ["git", "-C", sandbox.workdir, "config", "kbx.upstream", upstream])
+        docker.exec(sandbox.name, ["git", "-C", sandbox.clone_dir, "config", "kbx.upstream", upstream])
     docker.exec(sandbox.name, ["sh", "-c", 'cat > "$1"', "sh", NOTE], input=_note(sandbox, upstream).encode())
-    print(f"✓ Cloned into {sandbox.workdir}")
+    print(f"✓ Cloned into {sandbox.clone_dir}")
+
+
+def write_mount_note(docker: Docker, sandbox: Sandbox) -> None:
+    docker.exec(
+        sandbox.name,
+        ["sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1"', "sh", NOTE],
+        input=_mount_note(sandbox).encode(),
+    )
+
+
+def _mount_note(sandbox: Sandbox) -> str:
+    return f"""# kbx sandbox
+
+`{sandbox.workdir}` is the developer's own checkout, mounted from the host. Your
+changes and commits appear there immediately, and theirs appear here.
+
+- Commit freely. You cannot push: the developer pushes from the host.
+- Do not change `.git/config`, git hooks, or hook and editor files such as
+  `.husky/`, `.pre-commit-config.yaml`, `lefthook.yml`, `.vscode/settings.json`.
+  The host runs those; the kbx guard reverts such changes and pauses this
+  sandbox until the developer reviews them. Ask the developer instead.
+- Files you create as root stay owned by root on the host; work as `agent`.
+- When several agents work at once, give each its own worktree outside the
+  checkout: `git worktree add ~/work/{sandbox.project}-<task> -b <branch>`.
+"""
 
 
 def _note(sandbox: Sandbox, upstream: str) -> str:
     return f"""# kbx sandbox
 
-`{sandbox.workdir}` is a clone of the host project, seeded from a git bundle.
+`{sandbox.clone_dir}` is a clone of the host project, seeded from a git bundle.
 
 - The remote `host` holds the host's branches as `host/*`. The developer runs
   `kbx sync` on the host to refresh them; then `git fetch host` works here too.
@@ -174,7 +202,7 @@ def sync(docker: Docker, sandbox: Sandbox) -> None:
     assert bundle.stdout is not None
     result = docker.exec(
         sandbox.name,
-        ["sh", "-c", SYNC_SCRIPT, "sh", sandbox.workdir, HOST_BUNDLE],
+        ["sh", "-c", SYNC_SCRIPT, "sh", sandbox.clone_dir, HOST_BUNDLE],
         stdin=bundle.stdout,
         stderr=None,
         check=False,
@@ -203,7 +231,7 @@ def _valid_branch(root: Path, name: str) -> bool:
 def sandbox_branches(docker: Docker, sandbox: Sandbox) -> list[Branch]:
     out = docker.exec_text(
         sandbox.name,
-        ["git", "-C", sandbox.workdir, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/"],
+        ["git", "-C", sandbox.clone_dir, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/"],
     )
     branches: list[Branch] = []
     for line in out.splitlines():
@@ -218,7 +246,7 @@ def sandbox_branches(docker: Docker, sandbox: Sandbox) -> list[Branch]:
 
 def _bundle_out(docker: Docker, sandbox: Sandbox, refs: list[str], incremental: bool, dest: Path) -> bool:
     """Write a sandbox bundle to dest. False if there is nothing new to bundle."""
-    argv = ["git", "-C", sandbox.workdir, "bundle", "create", "-", *refs]
+    argv = ["git", "-C", sandbox.clone_dir, "bundle", "create", "-", *refs]
     if incremental:
         argv += ["--not", "--remotes=host"]
     with dest.open("wb") as handle:
@@ -315,7 +343,7 @@ def unfetched(docker: Docker, sandbox: Sandbox) -> list[Unfetched]:
     for branch in sandbox_branches(docker, sandbox):
         count = docker.exec_text(
             sandbox.name,
-            ["git", "-C", sandbox.workdir, "rev-list", "--count", branch.sha, "--not", "--remotes=host"],
+            ["git", "-C", sandbox.clone_dir, "rev-list", "--count", branch.sha, "--not", "--remotes=host"],
         )
         if count == "0":
             continue
@@ -332,14 +360,14 @@ def local_changes(docker: Docker, sandbox: Sandbox) -> list[str]:
     """Uncommitted changes (in every worktree) and stashes in the sandbox clone."""
     notes: list[str] = []
     listing = docker.exec_text(
-        sandbox.name, ["git", "-C", sandbox.workdir, "worktree", "list", "--porcelain"], check=False
+        sandbox.name, ["git", "-C", sandbox.clone_dir, "worktree", "list", "--porcelain"], check=False
     )
     trees = [line[len("worktree ") :] for line in listing.splitlines() if line.startswith("worktree ")]
-    for tree in trees or [sandbox.workdir]:
+    for tree in trees or [sandbox.clone_dir]:
         status = docker.exec_text(sandbox.name, ["git", "-C", tree, "status", "--porcelain"], check=False)
         if status:
             notes.append(f"{tree}: {len(status.splitlines())} uncommitted change(s)")
-    stashes = docker.exec_text(sandbox.name, ["git", "-C", sandbox.workdir, "stash", "list"], check=False)
+    stashes = docker.exec_text(sandbox.name, ["git", "-C", sandbox.clone_dir, "stash", "list"], check=False)
     if stashes:
         notes.append(f"{len(stashes.splitlines())} stash entr(y/ies)")
     return notes

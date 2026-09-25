@@ -195,7 +195,16 @@ def main() -> int:
         save(state)
         return 0
     if command == "stop":
-        state["containers"][args[1]]["State"]["Status"] = "exited"
+        state["containers"][args[-1]]["State"]["Status"] = "exited"
+        save(state)
+        return 0
+    if command in ("pause", "unpause"):
+        container = state["containers"][args[1]]
+        wanted, other = ("running", "paused") if command == "pause" else ("paused", "running")
+        if container["State"]["Status"] != wanted:
+            print(f"Error response from daemon: container {args[1]} is not {wanted}", file=sys.stderr)
+            return 1
+        container["State"]["Status"] = other
         save(state)
         return 0
     if command == "rm":

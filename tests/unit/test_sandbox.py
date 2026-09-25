@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import subprocess
 from pathlib import Path
 
 from kbx import config, paths, sandbox
@@ -36,7 +38,7 @@ class CreateArgsTest(TempHome):
         self.cfg = config.load(self.paths, {})
         self.sb = sandbox.for_project(self.temp / "proj")
 
-    def test_only_the_stage_is_mounted_from_the_host(self) -> None:
+    def test_clone_mode_mounts_only_the_stage_from_the_host(self) -> None:
         args = sandbox.create_args(self.sb, self.cfg, self.paths)
         mounts: list[str] = []
         for index, arg in enumerate(args):
@@ -52,6 +54,86 @@ class CreateArgsTest(TempHome):
             self.assertNotIn(forbidden, joined)
         self.assertNotIn("--network=host", joined)
         self.assertNotIn("-p", args)
+
+    def test_mount_mode_mounts_the_checkout_at_its_own_path(self) -> None:
+        repo = self.make_repo("checkout")
+        sb = sandbox.for_project(repo, "mount")
+        self.assertEqual(sb.workdir, str(repo))
+        self.assertEqual(sb.clone_dir, "/home/agent/work/checkout")
+        args = sandbox.create_args(sb, self.cfg, self.paths)
+        binds = [args[i + 1] for i, a in enumerate(args) if a == "--mount"]
+        self.assertEqual(
+            binds,
+            [
+                f"type=bind,source={self.paths.stage},target=/opt/kbx/stage,readonly",
+                f"type=bind,source={sb.project_dir},target={sb.project_dir}",
+            ],
+        )
+        self.assertIn("kbx.workspace=mount", args)
+        self.assertIn(f"KBX_HOST_UID={os.getuid()}", args)
+        self.assertIn(f"KBX_HOST_GID={os.getgid()}", args)
+        self.assertNotIn("docker.sock", " ".join(args))
+
+    def test_check_mountable(self) -> None:
+        repo = self.make_repo("ok")
+        sandbox.check_mountable(sandbox.for_project(repo, "mount"))
+        for path in ("/usr/src/x", "/etc/app", "/opt/kbx/stage", "/home", "/tmp", "/home/agent"):
+            with self.subTest(path=path), self.assertRaises(KbxError):
+                sandbox.check_mountable(sandbox.Sandbox("kbx-x", "x", Path(path), "mount"))
+        odd = self.make_repo("a,b")
+        with self.assertRaises(KbxError):
+            sandbox.check_mountable(sandbox.for_project(odd, "mount"))
+        broken = self.make_repo("broken")
+        subprocess.run(["rm", "-rf", str(broken / ".git")], check=True)
+        (broken / ".git").write_text("gitdir: /nowhere\n")
+        with self.assertRaises(KbxError):
+            sandbox.check_mountable(sandbox.for_project(broken, "mount"))
+
+    def test_linked_worktree_mounts_the_repository_directory(self) -> None:
+        repo = self.make_repo("main")
+        worktree = self.temp / "wt"
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", str(worktree)], check=True)
+        self.assertEqual(sandbox.git_dirs(worktree), (repo / ".git" / "worktrees" / "wt", repo / ".git"))
+        self.assertEqual(sandbox.git_dirs(repo), (repo / ".git", repo / ".git"))
+        sb = sandbox.for_project(worktree, "mount")
+        sandbox.check_mountable(sb)
+        args = sandbox.create_args(sb, self.cfg, self.paths)
+        binds = [args[i + 1] for i, a in enumerate(args) if a == "--mount"]
+        self.assertEqual(
+            binds[1:],
+            [
+                f"type=bind,source={worktree},target={worktree}",
+                f"type=bind,source={repo}/.git,target={repo}/.git",
+            ],
+        )
+        self.assertIn(f"kbx.gitdir={repo}/.git", args)
+
+    def test_submodule_and_separate_git_dir_checkouts(self) -> None:
+        library = self.make_repo("library")
+        superproject = self.make_repo("super")
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(superproject),
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                str(library),
+                "lib",
+            ],
+            check=True,
+        )
+        module = superproject / ".git" / "modules" / "lib"
+        self.assertEqual(sandbox.git_dirs(superproject / "lib"), (module, module))
+        self.assertEqual(sandbox.shared_gitdir(sandbox.for_project(superproject / "lib", "mount")), module)
+        separate = self.temp / "separate"
+        subprocess.run(
+            ["git", "init", "-q", "--separate-git-dir", str(self.temp / "store.git"), str(separate)], check=True
+        )
+        self.assertEqual(sandbox.git_dirs(separate), (self.temp / "store.git", self.temp / "store.git"))
 
     def test_runtime_network_dns_and_size(self) -> None:
         args = sandbox.create_args(self.sb, self.cfg, self.paths)
@@ -142,3 +224,16 @@ class LifecycleTest(TempHome):
         probe = [c for c in self.calls() if "python3" in c][-1]
         self.assertIn("172.30.0.1", probe)
         sandbox.firewall_check(self.docker, self.sb, self.cfg, {"KBX_UNSAFE_NO_FIREWALL_CHECK": "1"})
+
+    def test_stop_and_pause(self) -> None:
+        self.add_image()
+        sandbox.ensure_created(self.docker, self.sb, self.cfg, self.paths)
+        sandbox.ensure_running(self.docker, self.sb, timeout=5)
+        self.assertTrue(sandbox.pause(self.docker, self.sb))
+        self.assertEqual(sandbox.state(self.docker, self.sb), "paused")
+        with self.assertRaises(KbxError) as ctx:
+            sandbox.ensure_running(self.docker, self.sb, timeout=5)
+        self.assertIn("kbx resume", str(ctx.exception))
+        sandbox.stop(self.docker, self.sb)
+        self.assertEqual(sandbox.state(self.docker, self.sb), "exited")
+        self.assertIn(["unpause", self.sb.name], self.calls())

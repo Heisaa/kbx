@@ -97,3 +97,25 @@ class ConfigTest(TempHome):
                 self.load(text)
         with self.assertRaises(KbxError):
             self.load(None, {"KBX_AUTO_UPDATE": "maybe"})
+
+    def test_workspace(self) -> None:
+        cfg = self.load()
+        self.assertEqual(cfg.workspace.mode, "mount")
+        self.assertTrue(cfg.workspace.guard)
+        self.assertIn(".husky", cfg.workspace.protect)
+        cfg = self.load('[workspace]\nmode = "clone"\nprotect = ["tools/hooks/", ".envrc"]\n')
+        self.assertEqual(cfg.workspace.mode, "clone")
+        self.assertEqual(cfg.workspace.protect, ("tools/hooks", ".envrc"))
+        cfg = self.load('[workspace]\nmode = "clone"\n', {"KBX_WORKSPACE": "mount", "KBX_GUARD": "0"})
+        self.assertEqual(cfg.workspace.mode, "mount")
+        self.assertFalse(cfg.workspace.guard)
+        for text in (
+            '[workspace]\nmode = "shared"\n',
+            '[workspace]\nprotect = ["/etc/passwd"]\n',
+            '[workspace]\nprotect = ["../up"]\n',
+            '[workspace]\nprotect = [".git/hooks"]\n',
+            "[workspace]\nprotect = [1]\n",
+            "[workspace]\nguard = 1\n",
+        ):
+            with self.subTest(text=text), self.assertRaises(KbxError):
+                self.load(text)

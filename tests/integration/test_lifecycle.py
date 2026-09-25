@@ -89,7 +89,7 @@ class LifecycleTest(SandboxCase):
         self.assertNotEqual(self.sh("xclip -selection clipboard -t text/plain -o").returncode, 0)
 
     def test_07_home_survives_stop_start_and_recreate(self) -> None:
-        self.out("echo keep > ~/work/marker")
+        self.out("mkdir -p ~/work && echo keep > ~/work/marker")
         before = self.ready()["boot_id"]
         self.assertEqual(self.kbx("stop").returncode, 0)
         result = self.kbx("start")
@@ -102,4 +102,4 @@ class LifecycleTest(SandboxCase):
         self.assertEqual(self.kbx("recreate").returncode, 0)
         self.assertEqual(self.kbx("start").returncode, 0)
         self.assertEqual(self.out("cat ~/work/marker"), "keep")
-        self.assertTrue(self.out("ls ~/work/inttest/README.md"))
+        self.assertTrue(self.out(f"ls {self.repo}/README.md"))  # mount mode: the checkout

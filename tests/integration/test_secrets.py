@@ -31,5 +31,7 @@ class SecretsTest(SandboxCase):
             target, _, source = line.partition(" ")
             if str(self.home) in source:
                 self.assertEqual(target, "/opt/kbx/stage", line)
-        self.assertNotIn(str(self.repo), mounts)
         self.assertIn("/opt/kbx/stage", mounts)
+        # Mount mode: the checkout, at its own path, is the only other host path.
+        targets = {line.partition(" ")[0] for line in mounts.splitlines()}
+        self.assertEqual({t for t in targets if t.startswith(str(self.temp))}, {str(self.repo)})

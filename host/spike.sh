@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 0 host spike: check the risky assumptions (R1–R7) on this host.
+# Phase 0 host spike: check the risky assumptions (R1–R8) on this host.
 #
 #   host/spike.sh [--runtime kata] [--network kbx]
 #
@@ -26,8 +26,10 @@ result() { # id status detail
   case "$2" in PASS) pass=$((pass + 1)) ;; FAIL) fail=$((fail + 1)) ;; esac
 }
 run() { docker run --rm --runtime "$runtime" "$@"; }
+r8dir=""
 cleanup() {
-  docker rm -f kbx-spike-dind >/dev/null 2>&1
+  docker rm -f kbx-spike-dind kbx-spike-r8 >/dev/null 2>&1
+  [ -n "$r8dir" ] && rm -rf "$r8dir"
   docker volume rm kbx-spike-r2-privileged-varlibdocker kbx-spike-r2-privileged-store kbx-spike-r2-caps-varlibdocker kbx-spike-r2-caps-store kbx-spike-r7 >/dev/null 2>&1
 }
 trap cleanup EXIT
@@ -200,6 +202,25 @@ if [ "${copied:-0}" -gt 0 ] 2>/dev/null; then
   result R7 PASS "copy-up works ($copied entries). kbx-init copies the home template itself either way."
 else
   result R7 INFO "no copy-up under $runtime: fine, kbx-init copies /opt/kbx/home-template on first boot"
+fi
+
+# R8: mount mode. The checkout is bind-mounted at its own path and written from
+# the guest as the host user; the guard pauses the sandbox with docker pause.
+r8dir="$(mktemp -d "${TMPDIR:-/tmp}/kbx-spike-r8.XXXXXX")"
+run --user "$(id -u):$(id -g)" --mount "type=bind,source=$r8dir,target=$r8dir" alpine \
+  sh -c "echo hi > '$r8dir/f' && mkdir '$r8dir/d'" >/dev/null 2>&1
+owner="$(stat -c %u "$r8dir/f" 2>/dev/null)"
+paused=no
+if docker run -d --name kbx-spike-r8 --runtime "$runtime" alpine sleep 120 >/dev/null 2>&1 \
+  && docker pause kbx-spike-r8 >/dev/null 2>&1 \
+  && [ "$(docker inspect -f '{{.State.Status}}' kbx-spike-r8)" = paused ] \
+  && docker unpause kbx-spike-r8 >/dev/null 2>&1; then
+  paused=yes
+fi
+if [ "$(cat "$r8dir/f" 2>/dev/null)" = hi ] && [ -d "$r8dir/d" ] && [ "$owner" = "$(id -u)" ] && [ "$paused" = yes ]; then
+  result R8 PASS "bind mount writes through as uid $owner; docker pause/unpause works"
+else
+  result R8 FAIL "bind mount content '$(cat "$r8dir/f" 2>/dev/null)', owner '${owner:-?}' (want $(id -u)), pause: $paused"
 fi
 
 echo

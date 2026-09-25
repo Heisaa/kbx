@@ -39,6 +39,10 @@ class Paths:
     def log_dir(self) -> Path:
         return self.data_dir / "log"
 
+    @property
+    def guard_dir(self) -> Path:
+        return self.data_dir / "guard"
+
 
 def _xdg(env: Mapping[str, str], name: str, fallback: Path) -> Path:
     # The spec says relative values are invalid and must be ignored.

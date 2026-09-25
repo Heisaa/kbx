@@ -134,16 +134,17 @@ It checks, with throwaway containers:
 | R5 | VM sizing | `--memory/--cpus` reflected in the guest; else set `default_memory`/`default_vcpus` |
 | R6 | Nested virtualization | Bare metal, or nested KVM enabled |
 | R7 | Docker's volume copy-up under Kata | Informational: kbx-init copies the image's home template into a new volume itself |
+| R8 | Mount mode: does a bind-mounted checkout write through with the host user's uid, and does `docker pause` work? | Both; otherwise use `[workspace] mode = "clone"` |
 
 Record the results in `host/README.md` for your setup.
 
 ## Uninstall
 
 ```sh
-kbx rm                               # per project (asks; lists unfetched work)
+kbx rm                               # per project (asks; clone mode lists unfetched work)
 sudo systemctl disable --now kbx-firewall.service
 sudo rm /usr/local/sbin/kbx-firewall /etc/systemd/system/kbx-firewall.service /etc/kbx/firewall.conf
 docker network rm kbx
 docker image rm kbx-agent
-rm -rf ~/.local/share/kbx            # stage and logs (config stays in ~/.config/kbx)
+rm -rf ~/.local/share/kbx            # stage, logs, guard state (config stays in ~/.config/kbx)
 ```
