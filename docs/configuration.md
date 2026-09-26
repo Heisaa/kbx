@@ -64,6 +64,7 @@ Each can be overridden for one run with `KBX_<NAME>`, e.g.
 | `mode` | `"mount"` | `"mount"`: the checkout is mounted at its own path; you and the agent share it. `"clone"`: a private clone, git crosses as bundles (`kbx fetch`/`sync`). Applied at create; `kbx recreate` switches. `KBX_WORKSPACE` overrides |
 | `guard` | `true` | Mount mode: the host-side guard that reverts agent changes to git hooks, git config and `protect` paths, and pauses the sandbox. `KBX_GUARD` overrides |
 | `protect` | hook-framework and editor files | Paths relative to the project (files or directories) guarded like hooks. The default list: `.husky`, `.githooks`, `.lefthook`, `.pre-commit-config.yaml`/`.yml`, `lefthook.yml`/`.yaml` and their dotted and `-local` variants, `.vscode/settings.json`, `.vscode/tasks.json`. Setting it replaces the list. Takes effect at the next start |
+| `private` | `["target", ".venv"]` | Mount mode: build directories the sandbox keeps to itself, so builds on each side do not invalidate the other's. A directory from the sandbox's home volume is mounted over each, inside the VM only; the host keeps its own. Applies when the directory exists or its tool's file is beside it (`Cargo.toml` for `target`; `pyproject.toml`, `requirements.txt`, `uv.lock` and similar for `.venv`/`venv`; `package.json` for `node_modules`). Paths may be nested (`"backend/target"`). Checked at every launch |
 
 See [git-workflow.md](git-workflow.md) for what each mode means in practice.
 

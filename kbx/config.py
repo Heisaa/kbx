@@ -107,6 +107,8 @@ class WorkspaceConfig:
     # Mount mode: the host-side guard (kbx/guard.py). Off only for development.
     guard: bool = True
     protect: tuple[str, ...] = DEFAULT_PROTECT
+    # Directories the sandbox keeps to itself, mounted over the shared ones (kbx/private.py).
+    private: tuple[str, ...] = ("target", ".venv")
 
 
 @dataclass(frozen=True)
@@ -333,7 +335,18 @@ def _workspace(table: dict[str, Any], env: Mapping[str, str], where: str) -> Wor
         if not parts or Path(item).is_absolute() or ".." in parts or parts[0] == ".git":
             raise KbxError(f"{where}.protect: {item!r} must be a relative path inside the project, outside .git")
         protect.append(str(Path(item)))
-    return WorkspaceConfig(mode=mode, guard=guard, protect=tuple(protect))
+    raw_private: Any = table.get("private", list(defaults.private))
+    if not isinstance(raw_private, list) or not all(isinstance(item, str) for item in raw_private):  # pyright: ignore[reportUnknownVariableType]
+        raise KbxError(f"{where}.private must be a list of paths relative to the project")
+    private: list[str] = []
+    for item in [str(entry) for entry in raw_private]:  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType]
+        parts = Path(item).parts
+        if not parts or Path(item).is_absolute() or ".." in parts or parts[0] == ".git":
+            raise KbxError(f"{where}.private: {item!r} must be a relative path inside the project, outside .git")
+        if any(item == entry or item.startswith(entry + "/") or entry.startswith(item + "/") for entry in protect):
+            raise KbxError(f"{where}.private: {item!r} overlaps a protected path")
+        private.append(str(Path(item)))
+    return WorkspaceConfig(mode=mode, guard=guard, protect=tuple(protect), private=tuple(private))
 
 
 def _skills(table: dict[str, Any], home: Path, where: str) -> SkillsConfig:

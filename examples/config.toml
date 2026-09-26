@@ -59,6 +59,8 @@
 #   ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml",
 #   ".lefthook-local.yml", ".lefthook-local.yaml", ".vscode/settings.json",
 #   ".vscode/tasks.json"]      # files host tools run, guarded like hooks
+# private = ["target", ".venv"]  # mount mode: build dirs the sandbox keeps to itself
+#                             # (add "node_modules" for native add-ons)
 
 [host]
 # kbx host: Claude Code on the host, locked down. Everything else is fixed.

@@ -465,6 +465,29 @@ class MountModeTest(CliTest):
         self.assertEqual(result.returncode, 1)
         self.assertIn("not needed in mount mode", result.stderr)
 
+    def private_calls(self) -> list[list[str]]:
+        path = self.state_dir / "private.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_private_build_directories(self) -> None:
+        status, output = self.tty("start")
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.private_calls(), [], "no Cargo.toml, no .venv: nothing to mount")
+        (self.repo / "Cargo.toml").write_text("[package]\nname = 'x'\n")
+        (self.repo / "tools").mkdir()
+        (self.repo / "tools" / "pyproject.toml").write_text("")
+        config = self.home / ".config/kbx/config.toml"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('[workspace]\nprivate = ["target", ".venv", "tools/.venv"]\n')
+        self.clear_calls()
+        status, output = self.tty("start")
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.private_calls()[-1], ["sh", str(self.repo), "target", "tools/.venv"])
+        self.assertTrue(any(c[:3] == ["exec", "-u", "root"] and "kbx-private" in " ".join(c) for c in self.calls()))
+        self.behave(private_status=1)
+        status, output = self.tty("start")
+        self.assertIn("could not give the sandbox its own target, tools/.venv", output)
+
     def test_diff_runs_git_in_the_sandbox(self) -> None:
         self.assertEqual(self.run_kbx("start", cwd=self.repo).returncode, 0)
         run_git(self.repo, "commit", "-q", "--allow-empty", "-m", "agent commit")

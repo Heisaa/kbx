@@ -77,6 +77,11 @@ def emulate(state: dict[str, Any], argv: list[str], stdin: bytes) -> int | None:
         states = behave.get("session_states", {})
         print(json.dumps({name: states.get(name, {"attached": False}) for name in behave.get("sessions", [])}))
         return 0
+    if argv[:2] == ["sh", "-c"] and "kbx-private" in argv[2]:
+        # kbx/private.py: record which entries would be mounted (no mounts here).
+        with (ROOT / "private.jsonl").open("a") as handle:
+            handle.write(json.dumps(argv[3:]) + "\n")
+        return int(behave.get("private_status", 0))
     if argv == ["kbx-notify", "follow"]:
         for line in behave.get("follow", []):
             print(json.dumps(line), flush=True)

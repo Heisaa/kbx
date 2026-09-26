@@ -162,6 +162,10 @@ changes and commits appear there immediately, and theirs appear here.
   The host runs those; the kbx guard reverts such changes and pauses this
   sandbox until the developer reviews them. Ask the developer instead.
 - Files you create as root stay owned by root on the host; work as `agent`.
+- Build directories such as `target/` and `.venv/` are this sandbox's own,
+  mounted over the host's (which you do not see), so both sides keep their
+  builds. `cargo clean` or `rm -rf target` empty them and then report
+  "Device or resource busy": expected, the directory is empty.
 - When several agents work at once, give each its own worktree outside the
   checkout: `git worktree add ~/work/{sandbox.project}-<task> -b <branch>`.
 """

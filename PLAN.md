@@ -521,6 +521,24 @@ the guard checks once more and seals the state. Without a seal (the guard died,
 the host rebooted), the next start checks the old baseline before trusting the
 new one, and refuses to start on findings until `kbx resume`.
 
+
+### Private build directories
+
+Some directories in the checkout hold what one side built with its own
+toolchain: Cargo's `target/` (another `rustc`, glibc and environment) and a
+Python `.venv` (which points at one side's interpreter). Shared, each side's
+build invalidates the other's. `[workspace] private` (default `target`,
+`.venv`) lists directories the sandbox keeps to itself: at each launch, kbx
+bind-mounts `~/.cache/kbx-private/<path>` from the home volume over each,
+inside the VM only (`kbx/private.py`, as root, idempotent), creating it as
+`agent` if needed. An entry applies when the directory exists or its tool's
+file sits beside it, so other projects get no empty directories; a symlink
+stays shared. Paths are unchanged in the sandbox, the host never sees its
+build output, and `SYS_ADMIN` (already there for the inner dockerd) allows
+the mount. `cargo clean` and `rm -rf` of such a directory empty it but fail
+on the mount point (EBUSY); the agent note says so. The alternative,
+`CARGO_TARGET_DIR`, was rejected: `./target/...` in the sandbox would then run
+the host's stale build.
 ## Phase 3: git in and out (clone mode)
 
 The rule: **the host never runs git against a repository the agent can

@@ -34,6 +34,15 @@ starts) stay owned by root on the host.
   It is a view the sandbox produces: the agent is root there and could make
   its git lie, so it does not replace the guard.
 - **The agent cannot push.** It has no git credentials. You push from the host.
+- **Build directories are not shared.** Cargo's `target/` and a Python
+  `.venv` hold what one side built with its own toolchain, so sharing them
+  made each side rebuild after the other. The sandbox gets its own, mounted
+  over yours inside the VM (`[workspace] private`), and each side keeps its
+  builds. Paths stay the same (`./target/debug/app` works in both), but a
+  binary the agent built is not in your `target/`: build it on the host, or
+  run it in the sandbox. In the sandbox, `cargo clean` and `rm -rf target`
+  empty the directory and then report "Device or resource busy" (it is a
+  mount point); that is expected.
 - **Untracked files are shared too.** The agent can read `.env` files and other
   secrets in the checkout. The internet is open, so it could send them out. Use
   clone mode for projects where that matters.

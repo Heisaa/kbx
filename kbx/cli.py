@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import __version__, agents, clipd, dash, git, guard, host, image, review, sandbox, session, stage, watch
+from . import __version__, agents, clipd, dash, git, guard, host, image, private, review, sandbox, session, stage, watch
 from . import config as config_mod
 from . import modules as modules_mod
 from . import paths as paths_mod
@@ -115,6 +115,8 @@ def prepare(ctx: Context, *, seed_clone: bool = True) -> Sandbox:
     sandbox.firewall_check(ctx.docker, sb, ctx.config, dict(ctx.env))
     watch.ensure(ctx.paths, sb, ctx.config, ENTRY)
     if sb.mode == "mount":
+        for message in private.mount(ctx.docker, sb, ctx.config.workspace.private):
+            warn(message)
         if starting:
             git.write_mount_note(ctx.docker, sb)
     elif seed_clone and not git.is_seeded(ctx.docker, sb):

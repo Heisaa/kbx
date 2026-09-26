@@ -48,7 +48,9 @@ waits for an approval. A sandbox with no agent session and no shell for 2 hours
 stops itself to free its memory; the next kbx command starts it again.
 
 The agent's edits and commits show up in your checkout as it makes them, and
-yours show up in the sandbox. Review with `kbx diff` (uncommitted and new
+yours show up in the sandbox. Build directories are the exception: the sandbox
+keeps its own `target/` and `.venv` (mounted over yours inside the VM), so a
+build on one side does not force a full rebuild on the other. Review with `kbx diff` (uncommitted and new
 files; `--since-start` adds the commits made since the sandbox started), which
 runs git in the sandbox rather than on your host, before you run anything on
 the host, then push as usual.
