@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import __version__, agents, clipd, git, guard, image, sandbox, session, stage
+from . import __version__, agents, clipd, dash, git, guard, host, image, review, sandbox, session, stage, watch
 from . import config as config_mod
 from . import modules as modules_mod
 from . import paths as paths_mod
@@ -25,11 +25,13 @@ from .sandbox import Sandbox
 ENTRY = paths_mod.CHECKOUT / "bin" / "kbx"
 
 USAGE = """\
+kbx [dash]                          dashboard over all sandboxes (on a terminal)
 kbx claude|codex|pi [agent args…]   create/start the sandbox, update, attach
 kbx attach [claude|codex|pi]        reattach to a running session
 kbx shell                           bash in the sandbox (as agent)
 kbx start                           create/start the sandbox (and seed the clone), no attach
 kbx resume [--accept]               after the guard paused the sandbox: review, resume
+kbx diff [--stat] [--since-start|--since REV] [path…]   the agent's changes, from the sandbox's git
 kbx fetch [branch…]                 clone mode: sandbox branches → host refs/remotes/kbx/*
 kbx sync                            clone mode: host branches → sandbox refs/remotes/host/*
 kbx update                          update all agents without launching
@@ -40,6 +42,7 @@ kbx build                           generate the Dockerfile and build the image
 kbx check                           validate modules and config
 kbx seed [--dry-run|--status|--reset M]   manage home defaults
 kbx ls                              list sandboxes and their sessions
+kbx host [-c|-r [ID]] [--model M] [prompt]   Claude on the host, locked down (asks first)
 """
 
 
@@ -110,11 +113,14 @@ def prepare(ctx: Context, *, seed_clone: bool = True) -> Sandbox:
     elif sb.mode == "mount":
         warn("the kbx guard is off ([workspace] guard = false): the agent can plant git hooks the host runs")
     sandbox.firewall_check(ctx.docker, sb, ctx.config, dict(ctx.env))
+    watch.ensure(ctx.paths, sb, ctx.config, ENTRY)
     if sb.mode == "mount":
         if starting:
             git.write_mount_note(ctx.docker, sb)
     elif seed_clone and not git.is_seeded(ctx.docker, sb):
         git.seed(ctx.docker, sb)
+    if starting:
+        review.record_start(ctx.docker, ctx.paths, sb)
     return sb
 
 
@@ -163,7 +169,8 @@ def _attach(ctx: Context, sb: Sandbox, agent: str, inner: Sequence[str]) -> None
         sb,
         inner,
         workdir=sb.workdir,
-        env=session.session_env(ctx.module_env()),
+        # Marks the session kbx started; kbx-notify reports only these.
+        env=session.session_env({**ctx.module_env(), "KBX_SESSION": agent}),
         host_env=host_env,
     )
 
@@ -204,6 +211,7 @@ def cmd_attach(ctx: Context, args: argparse.Namespace) -> int:
     sandbox.firewall_check(ctx.docker, sb, ctx.config, dict(ctx.env))
     if guarded(ctx, sb):
         guard.ensure(ctx.paths, sb, ctx.docker, ENTRY, ctx.config.workspace.protect)
+    watch.ensure(ctx.paths, sb, ctx.config, ENTRY)
     _attach(ctx, sb, name, session.dtach_attach(name, ctx.config.launcher.detach_key))
     return 0
 
@@ -252,6 +260,34 @@ def cmd_resume(ctx: Context, args: argparse.Namespace) -> int:
         guard.ensure(ctx.paths, sb, ctx.docker, ENTRY, ctx.config.workspace.protect)
     print(f"✓ {sb.name} " + ("resumed" if status == "paused" else "can start again"))
     return 0
+
+
+def _pathspecs(sb: Sandbox, paths: Sequence[str], cwd: Path) -> list[str]:
+    """Host paths as pathspecs from the repository root, where git runs in the sandbox."""
+    result: list[str] = []
+    for item in paths:
+        target = Path(os.path.normpath(cwd / item))
+        if target != sb.project_dir and sb.project_dir not in target.parents:
+            raise KbxError(f"{item} is outside {sb.project_dir}")
+        result.append(
+            ":(top,literal)" + (target.relative_to(sb.project_dir).as_posix() if target != sb.project_dir else ".")
+        )
+    return result
+
+
+def cmd_diff(ctx: Context, args: argparse.Namespace) -> int:
+    sb = existing_running(ctx)
+    if sb.mode == "clone" and not git.is_seeded(ctx.docker, sb):
+        raise KbxError(f"the sandbox clone {sb.workdir} does not exist yet")
+    if args.since_start and args.since:
+        raise KbxError("use --since-start or --since, not both")
+    base = review.start_point(ctx.paths, sb.name) if args.since_start else (args.since or "")
+    if base and not review.revision_ok(base):
+        raise KbxError(f"not a revision: {base!r}")
+    if sb.mode == "clone":
+        print(f"(the sandbox's clone at {sb.workdir}; `kbx fetch` brings its commits to the host)", file=sys.stderr)
+    specs = _pathspecs(sb, args.paths, Path.cwd())
+    return review.run(ctx.docker, sb, base=base, stat=args.stat, pathspecs=specs, env=ctx.env)
 
 
 def cmd_fetch(ctx: Context, args: argparse.Namespace) -> int:
@@ -429,6 +465,7 @@ def cmd_rm(ctx: Context, args: argparse.Namespace) -> int:
     sandbox.remove_container(ctx.docker, sb)
     sandbox.remove_volumes(ctx.docker, sb)
     guard.remove(ctx.paths, sb.name)
+    review.forget_start(ctx.paths, sb.name)
     print(f"✓ Removed {sb.name}")
     return 0
 
@@ -497,6 +534,30 @@ def cmd_seed(ctx: Context, args: argparse.Namespace) -> int:
     return ctx.docker.exec_passthrough(sb.name, argv)
 
 
+def cmd_dash(ctx: Context, args: argparse.Namespace) -> int:
+    return dash.run(ctx.docker, ctx.paths, ctx.config, ctx.resolved, entry=ENTRY)
+
+
+def cmd_host(ctx: Context, args: argparse.Namespace) -> int:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise KbxError("kbx host needs a terminal: it asks before it starts, and Claude asks before every step")
+    project = git.project_root(Path.cwd())
+    extra = host.claude_args(resume=args.resume, continue_=args.continue_, model=args.model, prompt=args.prompt)
+    host.preflight(ctx.env, ctx.paths)
+    for line in host.summary(project, ctx.config, ctx.paths):
+        print(line)
+    sb = sandbox.for_project(project, ctx.config.workspace.mode)
+    if sandbox.state(ctx.docker, sb) == "running":
+        print(f"  note: {sb.name} is running for this project too; both can edit the checkout.")
+    if not _ask("Start Claude on the host?", False):
+        print("Not started.")
+        return 1
+    argv, env = host.prepare(ctx.paths, ctx.config, project, ctx.env, extra)
+    os.chdir(project)
+    sys.stdout.flush()
+    os.execvpe(argv[0], argv, env)
+
+
 def cmd_ls(ctx: Context, args: argparse.Namespace) -> int:
     rows = sandbox.list_sandboxes(ctx.docker)
     if not rows:
@@ -523,6 +584,11 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("start", help="create/start the sandbox without attaching")
     resume = sub.add_parser("resume", help="review what the guard stopped and resume the sandbox")
     resume.add_argument("--accept", action="store_true", help="take the agent's quarantined versions back")
+    diff = sub.add_parser("diff", help="the agent's changes (uncommitted, untracked), from the sandbox's git")
+    diff.add_argument("--stat", action="store_true", help="a summary per file")
+    diff.add_argument("--since-start", action="store_true", help="everything since the sandbox started, commits too")
+    diff.add_argument("--since", metavar="REV", help="everything since REV, commits too")
+    diff.add_argument("paths", nargs="*", help="limit to these paths")
     fetch = sub.add_parser("fetch", help="sandbox branches → host refs/remotes/kbx/*")
     fetch.add_argument("branches", nargs="*")
     sub.add_parser("sync", help="host branches → sandbox refs/remotes/host/*")
@@ -546,7 +612,15 @@ def parser() -> argparse.ArgumentParser:
     group.add_argument("--status", action="store_true")
     group.add_argument("--reset", metavar="MODULE")
     seed.add_argument("-y", "--yes", action="store_true")
+    host_parser = sub.add_parser("host", help="Claude Code on the host, locked down; asks first")
+    host_parser.add_argument(
+        "-c", "--continue", dest="continue_", action="store_true", help="continue the last session"
+    )
+    host_parser.add_argument("-r", "--resume", nargs="?", const="", metavar="ID", help="resume a session")
+    host_parser.add_argument("--model", help="model for the session")
+    host_parser.add_argument("prompt", nargs="?", help="a first prompt")
     sub.add_parser("ls", help="list sandboxes")
+    sub.add_parser("dash", help="terminal dashboard over all sandboxes")
     return top
 
 
@@ -555,6 +629,7 @@ COMMANDS = {
     "shell": cmd_shell,
     "start": cmd_start,
     "resume": cmd_resume,
+    "diff": cmd_diff,
     "fetch": cmd_fetch,
     "sync": cmd_sync,
     "update": cmd_update,
@@ -565,7 +640,9 @@ COMMANDS = {
     "rm": cmd_rm,
     "build": cmd_build,
     "seed": cmd_seed,
+    "host": cmd_host,
     "ls": cmd_ls,
+    "dash": cmd_dash,
 }
 
 
@@ -577,8 +654,12 @@ def dispatch(argv: Sequence[str], env: Mapping[str, str]) -> int:
         return clipd.run(paths_mod.resolve(env), argv[1])
     if argv and argv[0] == "_guard" and len(argv) == 2:
         return guard.run(paths_mod.resolve(env), argv[1])
+    if argv and argv[0] == "_watch" and len(argv) == 2:
+        return watch.run(paths_mod.resolve(env), argv[1])
     args = parser().parse_args(argv)
     if args.command is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return cmd_dash(Context.load(env), args)
         parser().print_help()
         return 2
     if args.command == "check":

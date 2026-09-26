@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from collections.abc import Sequence
@@ -159,8 +160,47 @@ def _daemon_version_note(docker: Docker, sandbox: Sandbox) -> None:
         )
 
 
+def skip_onboarding(docker: Docker, sandbox: Sandbox, agent: Agent) -> None:
+    """Mark first-run screens done and trust the workdir (see kbx_sandbox/onboard.py)."""
+    if agent.name not in ("claude", "codex"):
+        return
+    status = docker.exec_passthrough(sandbox.name, ["kbx-onboard", agent.name, sandbox.workdir])
+    if status != 0:
+        print(f"⚠ could not skip {agent.name}'s first-run screens; on an older image, run `kbx build`", file=sys.stderr)
+
+
+def login_status(docker: Docker, sandbox: Sandbox, names: Sequence[str] = ()) -> dict[str, tuple[bool | None, str]]:
+    """Each agent's login from `kbx-login-status`: (logged in, or None if unknown; detail)."""
+    result = docker.exec(sandbox.name, ["kbx-login-status", *names], check=False, timeout=90)
+    if result.returncode != 0:
+        raise KbxError("kbx-login-status failed (an image from before it? run `kbx build`)")
+    data = json.loads(result.stdout)
+    found: dict[str, tuple[bool | None, str]] = {}
+    for name in AGENTS:
+        item = data.get(name) if isinstance(data, dict) else None
+        if isinstance(item, dict):
+            ok = item.get("ok")
+            found[name] = (ok if isinstance(ok, bool) else None, str(item.get("detail") or ""))
+    return found
+
+
+def login_hint(docker: Docker, sandbox: Sandbox, agent: Agent) -> None:
+    """Say so before attaching when the agent is not logged in."""
+    try:
+        ok, _ = login_status(docker, sandbox, [agent.name]).get(agent.name, (None, ""))
+    except (KbxError, ValueError):
+        return
+    if ok is False:
+        how = {"claude": "type /login in Claude", "codex": 'choose "Sign in with Device Code" in Codex'}
+        print(f"→ {agent.name} is not logged in: {how.get(agent.name, 'use /login')}. It persists in this sandbox.")
+
+
 def prelaunch(docker: Docker, sandbox: Sandbox, agent: Agent, config: Config, resolved: list[Resolved]) -> None:
     reseed(docker, sandbox, agent)
+    if config.launcher.skip_onboarding:
+        skip_onboarding(docker, sandbox, agent)
     run_before_launch(docker, sandbox, agent, resolved)
     if agent.name == "codex" and config.launcher.remote_control:
-        codex_remote_control(docker, sandbox)
+        codex_remote_control(docker, sandbox)  # says how to log in if needed
+    else:
+        login_hint(docker, sandbox, agent)

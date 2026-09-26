@@ -8,6 +8,7 @@
 | `kbx-firewall.service` | systemd unit: after and part of `docker.service` |
 | `install-firewall` | Installs and starts the two above, writes `/etc/kbx/firewall.conf` |
 | `kata-configuration.toml` | Kata settings kbx expects in `/etc/kata-containers/configuration.toml` |
+| `claude-code-release.asc` | Anthropic's Claude Code release signing key (fingerprint `31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF 1A7E CACE`, pinned in `kbx/hostclaude.py`); `kbx host` checks its own Claude Code download with it |
 
 Install steps: [docs/host-setup.md](../docs/host-setup.md).
 

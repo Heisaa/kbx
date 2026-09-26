@@ -1,0 +1,2 @@
+# kbx-notify records the end of each turn and approval requests for the host.
+notify = ["kbx-notify", "codex"]

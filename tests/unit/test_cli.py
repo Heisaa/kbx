@@ -24,7 +24,8 @@ class CliTest(TempHome):
         self.addCleanup(self.stop_guards)
 
     def stop_guards(self) -> None:
-        for pid_file in (self.home / ".local/share/kbx/run").glob("guard-*.pid"):
+        run_dir = self.home / ".local/share/kbx/run"
+        for pid_file in [*run_dir.glob("guard-*.pid"), *run_dir.glob("watch-*.pid")]:
             try:
                 os.kill(int(pid_file.read_text()), signal.SIGTERM)
             except (OSError, ValueError):
@@ -45,7 +46,9 @@ class CliTest(TempHome):
                 self.fail(f"sandbox is {self.status()}, not {wanted}")
             time.sleep(0.1)
 
-    def tty(self, *args: str, cwd: Path | None = None, env: dict[str, str] | None = None) -> tuple[int, str]:
+    def tty(
+        self, *args: str, cwd: Path | None = None, env: dict[str, str] | None = None, answer: str = ""
+    ) -> tuple[int, str]:
         master, slave = pty.openpty()
         full_env = dict(self.env)
         full_env.update(env or {})
@@ -59,6 +62,8 @@ class CliTest(TempHome):
             close_fds=True,
         )
         os.close(slave)
+        if answer:
+            os.write(master, answer.encode())  # waits in the terminal until read
         chunks: list[bytes] = []
         while True:
             try:
@@ -113,6 +118,7 @@ class CliTest(TempHome):
         joined = [" ".join(c) for c in self.exec_calls()]
         self.assertTrue(any("claude update" in c for c in joined), "auto-update ran")
         self.assertTrue(any("kbx-seed --only-prefix .claude/" in c for c in joined))
+        self.assertTrue(any(c.endswith("kbx-onboard claude /home/agent/work/myproj") for c in joined))
         self.assertTrue(any("sys.exit(0 if exc.errno" in c for c in joined), "firewall probe ran")
         self.assertTrue((self.home / ".local/share/kbx/stage/config.json").exists())
         self.assertIn("Detach with Ctrl-\\", output)
@@ -143,6 +149,14 @@ class CliTest(TempHome):
         self.assertIn("pi update failed", output)
         self.assertEqual(self.attached()["argv"][-1], "pi")
 
+    def test_skip_onboarding_off(self) -> None:
+        self.tty("claude", env={"KBX_SKIP_ONBOARDING": "false"})
+        self.assertFalse(any("kbx-onboard" in " ".join(c) for c in self.exec_calls()))
+
+    def test_pi_has_no_onboarding_step(self) -> None:
+        self.tty("pi")
+        self.assertFalse(any("kbx-onboard" in " ".join(c) for c in self.exec_calls()))
+
     def test_auto_update_off(self) -> None:
         self.tty("pi", env={"KBX_AUTO_UPDATE": "false"})
         joined = [" ".join(c) for c in self.exec_calls()]
@@ -167,6 +181,110 @@ class CliTest(TempHome):
         self.assertEqual(status, 0, output)
         self.assertIn("codex login --device-auth", output)
         self.assertFalse(any("remote-control start" in " ".join(c) for c in self.exec_calls()))
+
+    def test_login_hint_and_session_marker(self) -> None:
+        self.behave(logins={"claude": {"ok": False, "detail": "not logged in"}})
+        status, output = self.tty("claude")
+        self.assertEqual(status, 0, output)
+        self.assertIn("claude is not logged in: type /login in Claude", output)
+        self.assertIn("KBX_SESSION=claude", self.exec_calls()[-1])
+        self.clear_calls()
+        self.behave(logins={}, sessions=[])
+        status, output = self.tty("pi")
+        self.assertNotIn("not logged in", output)
+
+    def test_watcher_notifies_when_detached(self) -> None:
+        sent = self.temp / "notify-send.log"
+        fake = self.temp / "bin" / "notify-send"
+        fake.write_text(f'#!/bin/sh\nprintf "%s|" "$@" >> {sent}\necho >> {sent}\n')
+        fake.chmod(0o755)
+        events = [
+            {"type": "sessions", "sessions": {"claude": {"attached": False}}},
+            {"type": "event", "agent": "claude", "state": "working", "message": "", "attached": False},
+            {"type": "event", "agent": "claude", "state": "done", "message": "All <b>tests</b> pass", "attached": True},
+            {"type": "event", "agent": "claude", "state": "waiting", "message": "-u critical", "attached": False},
+            {"type": "event", "agent": "evil", "state": "done", "message": "x", "attached": False},
+        ]
+        self.behave(follow=events)
+        status, output = self.tty("claude", env={"KBX_NOTIFY": "detached"})
+        self.assertEqual(status, 0, output)
+        deadline = time.monotonic() + 20
+        while not sent.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        time.sleep(0.5)
+        lines = sent.read_text().splitlines()
+        # Only the detached "waiting" event; the text stays an argument after `--`.
+        self.assertEqual(lines, ["-a|kbx|-u|normal|--|claude needs you · myproj|-u critical|"])
+        pid = int((self.home / ".local/share/kbx/run" / f"watch-{self.sandbox_name()}.pid").read_text())
+        self.assertIn(b"_watch", Path(f"/proc/{pid}/cmdline").read_bytes())
+
+    def test_diff(self) -> None:
+        self.clone_mode()
+        result = self.run_kbx("diff", cwd=self.repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no sandbox for this project", result.stderr)
+
+    def fake_host_tools(self) -> Path:
+        """bwrap and socat stand-ins, and kbx's own Claude as a recorder of argv, cwd and environment.
+        A `claude` on PATH must never run."""
+        record = self.temp / "host-claude.json"
+        bin_dir = self.temp / "bin"
+        copy = self.home / ".local/share/kbx/host-claude-bin/1.0.0/claude"
+        copy.parent.mkdir(parents=True)
+        (copy.parent.parent / "current").write_text("1.0.0\n")
+        copy.write_text(
+            f"#!{sys.executable}\nimport json, os, sys\n"
+            f"open({str(record)!r}, 'w').write(json.dumps({{'argv': sys.argv, 'cwd': os.getcwd(), 'env': dict(os.environ)}}))\n"
+        )
+        (bin_dir / "claude").write_text("#!/bin/sh\necho WRONG CLAUDE; exit 3\n")
+        for name in ("bwrap", "socat"):
+            (bin_dir / name).write_text("#!/bin/sh\nexit 0\n")
+        for path in (copy, bin_dir / "claude", bin_dir / "bwrap", bin_dir / "socat"):
+            path.chmod(0o755)
+        return record
+
+    def test_host_asks_first(self) -> None:
+        record = self.fake_host_tools()
+        status, output = self.tty("host", answer="n\n", env={"KBX_AUTO_UPDATE": "false"})
+        self.assertEqual(status, 1, output)
+        self.assertIn("outside any VM", output)
+        self.assertIn("Not started.", output)
+        self.assertFalse(record.exists())
+        result = self.run_kbx("host", cwd=self.repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("needs a terminal", result.stderr)
+
+    def test_host_launches_locked_down(self) -> None:
+        record = self.fake_host_tools()
+        env = {"GITHUB_TOKEN": "secret", "SSH_AUTH_SOCK": "/run/agent.sock", "KBX_AUTO_UPDATE": "false"}
+        (self.repo / "sub").mkdir()
+        status, output = self.tty(
+            "host", "-c", "--model", "opus", "fix the build", cwd=self.repo / "sub", env=env, answer="y\n"
+        )
+        self.assertEqual(status, 0, output)
+        self.assertNotIn("WRONG CLAUDE", output)
+        ran = json.loads(record.read_text())
+        self.assertEqual(ran["argv"][0], str(self.home / ".local/share/kbx/host-claude-bin/1.0.0/claude"))
+        argv = ran["argv"][1:]
+        self.assertEqual(argv[:4], ["--restricted", "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--strict-mcp-config"])
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "manual")
+        self.assertEqual(argv[-5:], ["--continue", "--model", "opus", "--", "fix the build"])
+        self.assertEqual(ran["cwd"], str(self.repo))
+        self.assertNotIn("GITHUB_TOKEN", ran["env"])
+        self.assertNotIn("SSH_AUTH_SOCK", ran["env"])
+        self.assertEqual(ran["env"]["DISABLE_AUTOUPDATER"], "1", "the copy must never install itself")
+        state = Path(ran["env"]["CLAUDE_CONFIG_DIR"])
+        self.assertEqual(state, self.home / ".local/share/kbx/host-claude")
+        self.assertTrue(json.loads((state / ".claude.json").read_text())["hasCompletedOnboarding"])
+        settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
+        self.assertIn(str(self.repo / ".git"), settings["sandbox"]["filesystem"]["denyWrite"])
+        self.assertEqual(settings["sandbox"]["filesystem"]["denyRead"][0], str(self.home))
+
+    def test_host_rejects_loosening_flags(self) -> None:
+        self.fake_host_tools()
+        for flag in ("--dangerously-skip-permissions", "--settings", "--add-dir"):
+            result = self.run_kbx("host", flag, "x", cwd=self.repo)
+            self.assertEqual(result.returncode, 2, flag)
 
     def test_not_a_git_repository(self) -> None:
         plain = self.temp / "plain"
@@ -346,6 +464,39 @@ class MountModeTest(CliTest):
         result = self.run_kbx("fetch", cwd=self.repo)
         self.assertEqual(result.returncode, 1)
         self.assertIn("not needed in mount mode", result.stderr)
+
+    def test_diff_runs_git_in_the_sandbox(self) -> None:
+        self.assertEqual(self.run_kbx("start", cwd=self.repo).returncode, 0)
+        run_git(self.repo, "commit", "-q", "--allow-empty", "-m", "agent commit")
+        (self.repo / "README.md").write_text("hello\nchanged\n")
+        (self.repo / "new.txt").write_text("\x1b[8mhidden\x1b[0m\n")
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub" / "x.txt").write_text("x\n")
+        self.clear_calls()
+        result = self.run_kbx("diff", cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("+changed", result.stdout)
+        self.assertIn("+++ b/new.txt", result.stdout)
+        self.assertIn("+?[8mhidden?[0m", result.stdout)  # visible, and no escape reaches the terminal
+        self.assertNotIn("\x1b", result.stdout)
+        self.assertEqual(
+            run_git(self.repo, "status", "--porcelain"), "M README.md\n?? new.txt\n?? sub/", "index untouched"
+        )
+        self.assertTrue(
+            any(c[:1] == ["exec"] and "ls-files" in " ".join(c) for c in self.calls()), "git in the sandbox"
+        )
+        stat = self.run_kbx("diff", "--stat", "--since-start", cwd=self.repo / "sub")
+        self.assertEqual(stat.returncode, 0, stat.stderr)
+        self.assertIn("agent commit", stat.stdout)
+        self.assertIn("3 files changed", stat.stdout)
+        only = self.run_kbx("diff", "x.txt", cwd=self.repo / "sub")
+        self.assertIn("+++ b/sub/x.txt", only.stdout)
+        self.assertNotIn("README", only.stdout)
+        outside = self.run_kbx("diff", "../../elsewhere", cwd=self.repo / "sub")
+        self.assertEqual(outside.returncode, 1)
+        self.assertIn("is outside", outside.stderr)
+        bad = self.run_kbx("diff", "--since", "--output=/tmp/x", cwd=self.repo)
+        self.assertNotEqual(bad.returncode, 0)
 
     def test_guard_pauses_and_resume(self) -> None:
         self.tty("claude")

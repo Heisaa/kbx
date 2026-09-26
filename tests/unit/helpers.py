@@ -47,6 +47,9 @@ class TempHome(unittest.TestCase):
             "FAKE_DOCKER_STATE": str(self.state_dir),
             "GIT_CONFIG_GLOBAL": str(gitconfig),
             "GIT_CONFIG_NOSYSTEM": "1",
+            # No host watcher daemons unless a test asks for one (tests/unit/test_watch.py).
+            "KBX_NOTIFY": "off",
+            "KBX_IDLE_STOP": "off",
         }
         patcher = mock.patch.dict(os.environ, self.env, clear=True)
         patcher.start()
@@ -61,7 +64,9 @@ class TempHome(unittest.TestCase):
         return json.loads(path.read_text())
 
     def write_state(self, state: dict[str, Any]) -> None:
-        (self.state_dir / "state.json").write_text(json.dumps(state))
+        temp = self.state_dir / "state.test.tmp"
+        temp.write_text(json.dumps(state))
+        os.replace(temp, self.state_dir / "state.json")
 
     def behave(self, **values: Any) -> None:
         state = self.docker_state()
@@ -77,7 +82,10 @@ class TempHome(unittest.TestCase):
         path = self.state_dir / "calls.jsonl"
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines()]
+        lines = path.read_text().splitlines()
+        if lines and not lines[-1].endswith("]"):
+            lines.pop()  # a call still being written
+        return [json.loads(line) for line in lines]
 
     def clear_calls(self) -> None:
         (self.state_dir / "calls.jsonl").unlink(missing_ok=True)

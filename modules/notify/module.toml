@@ -1,0 +1,2 @@
+description = "Agent hooks that report working / waiting / done to the host (desktop notifications, dashboard)"
+default = true

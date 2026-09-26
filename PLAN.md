@@ -456,6 +456,9 @@ run with `KBX_<NAME>` (for example `KBX_REMOTE_CONTROL=false kbx claude`):
 | --- | --- | --- |
 | `auto_update` | `true` | Update the launched agent before starting it (skipped when reattaching) |
 | `remote_control` | `true` | Claude: `--remote-control`. Codex: login check + `codex remote-control start` |
+| `skip_onboarding` | `true` | Mark Claude/Codex first-run screens done and trust the working directory before launch |
+| `notify` | `"detached"` | Desktop notifications from agent hooks: `detached`, `always` or `off` |
+| `idle_stop` | `"2h"` | Stop after this long with no agent session and no shell; `"off"` never |
 | `codex_search` | `true` | Codex search flags (as today) |
 | `shared_skills` | `true` | Stage and mount skills |
 | `detach_key` | `^\` | dtach detach key |
@@ -818,8 +821,13 @@ login done once per project sandbox survives stops and recreates.
 
 ### Claude Code
 
-- Log in once: `kbx shell` → `claude`, then `/login` with the claude.ai
-  subscription. Remote control needs a claude.ai login, not an API key.
+- Log in once: `/login` with the claude.ai subscription. Remote control
+  needs a claude.ai login, not an API key.
+- First-run screens are skipped (`[launcher] skip_onboarding`): before each
+  launch `kbx-onboard` sets `hasCompletedOnboarding` and the working
+  directory's `hasTrustDialogAccepted` in `~/.claude.json`, and for Codex
+  `projects."<workdir>".trust_level = "trusted"` (only if unset). The sandbox
+  is the trust boundary, so the folder-trust prompt protects nothing here.
 - Launch: the launcher inserts `--remote-control` after the options and
   before any `--` (the flag takes an optional name, so it must not precede a
   positional argument), unless the user already passed it. An optional name comes from `kbx claude
@@ -929,6 +937,112 @@ dtach -A /run/kbx/sessions/claude.sock -e "$KBX_DETACH_KEY" -r winch \
   so Herdr can still recognise the agent.
 
 ---
+
+## Notifications, login status and the idle stop
+
+**What the agents do.** The `notify` module (on by default) seeds hooks that
+run `kbx-notify` in the sandbox: Claude Code's `UserPromptSubmit` and
+`PostToolUse` (working), `Notification` with `permission_prompt` or
+`elicitation_dialog` (waiting), `Stop` (done) and `SessionEnd`; Codex's
+`notify` program (`agent-turn-complete`, `approval-requested`). It records
+the state in `/run/kbx/agents/<agent>.json` and appends it to
+`events.jsonl`. Only sessions the launcher started count (it sets
+`KBX_SESSION=<agent>`). Hooks never print or fail, and `PostToolUse` writes
+only on a change. `kbx-session status` reports each live session's state and
+whether a terminal is attached: dtach sets the socket's execute bit while a
+client is attached, and the socket's mtime is the session's start, so a state
+from an earlier session is ignored.
+
+**The host watcher.** `kbx _watch NAME` runs per running sandbox, started by
+the launcher like the guard, and follows `kbx-notify follow` over one
+long-lived `docker exec`, so the sandbox still never connects to the host. On
+`waiting` or `done` it runs `notify-send` (`[launcher] notify`: only when no
+terminal is attached to that session, always, or off), at most once a minute
+for the same text and six a minute in all. The text is untrusted: type-checked, control characters
+removed, cut short, markup escaped, and passed after `--`.
+
+**Idle stop.** The same watcher stops the sandbox after `[launcher]
+idle_stop` (2 h) with no agent session (from the stream's periodic session
+list) and no interactive `docker exec` into it (host `/proc`), the way `kbx
+stop` does; the guard seals as usual. Never while paused or with a guard
+alert pending. An image without `kbx-notify` falls back to polling
+`kbx-session list` for the idle stop only. The Codex app-server daemon does
+not count: it outlives every Codex session, so counting it would keep most
+sandboxes from ever stopping. Remote control started with `kbx rc-start` and
+no open session therefore ends at an idle stop (`idle_stop = "off"` keeps it).
+
+**Login status.** `kbx-login-status` answers from `claude auth status`,
+`codex login status` and pi's `auth.json` provider names (no secrets). The
+launcher says how to log in before attaching to a fresh session, and the
+dashboard shows it per agent.
+
+## The exception: `kbx host`
+
+Some tasks need the host (devices, the desktop, the host's services). `kbx
+host` runs Claude Code there, as a conscious exception: a terminal is
+required, it prints what the session may do and asks, and it passes on only
+`--continue`, `--resume`, `--model` and a prompt, so no flag can loosen it.
+Everything else is one generated settings file plus flags, checked against
+Claude Code 2.1.283:
+
+- kbx's own Claude Code (`kbx/hostclaude.py`), so the host needs no Claude
+  install and has no `claude` command that runs unlocked by mistake. From
+  downloads.claude.ai, like the official installer but without its `claude
+  install` step: the channel's version, `manifest.json`, whose detached PGP
+  signature must be good and by Anthropic's release key (kept in
+  `host/claude-code-release.asc`, fingerprint `31DD DE24 DDFA B679 F42D 7BD2
+  BAA9 29FF 1A7E CACE` pinned in code), then the platform binary against the
+  manifest's SHA-256 and size. Stored in `$XDG_DATA_HOME/kbx/host-claude-bin/`,
+  the old version removed after an update. Run with `DISABLE_AUTOUPDATER`,
+  `DISABLE_UPDATES` and `DISABLE_INSTALLATION_CHECKS`: without them the copy
+  updates itself within a minute into `~/.local/bin/claude` and
+  `~/.local/share/claude` (tested). kbx updates it at launch instead
+  (`[launcher] auto_update`, `[host] channel`), keeping the current copy when
+  offline.
+- `--restricted` (user, project and local settings ignored; file tools
+  confined to the project; a person approves settings, git and tool-config
+  writes; no bypass), `--tools Bash,Read,Edit,Write,Glob,Grep` (no web tools),
+  `--strict-mcp-config`, and `CLAUDE_CONFIG_DIR` in kbx's data directory, so
+  the session has its own login and history.
+- Permissions: mode `manual`, `disableAutoMode` and
+  `disableBypassPermissionsMode`; `Edit(...)` denied for the git directories
+  and guarded files.
+- The command sandbox (bubblewrap, socat and seccomp): `enabled`,
+  `failIfUnavailable`, `allowUnsandboxedCommands: false`,
+  `autoAllowBashIfSandboxed: false`; `denyRead` $HOME, `/run/user/<uid>`,
+  `/mnt`, `/media` with `allowRead` for the project and `[host] allow_read`;
+  `allowWrite` the project and `[host] allow_write`; `denyWrite` the git
+  directories (a linked worktree's shared one too), the guard's `protect`
+  list and `.claude`, `.mcp.json`, `.envrc`, `.vscode`, `.idea`; network only
+  to `[host] allowed_domains`. Unix sockets are blocked by seccomp on Linux.
+- A scrubbed environment (basic variables and `[host] env`).
+- A preflight refuses without `claude`, `bwrap` or `socat`, or when
+  bubblewrap cannot create a namespace (Ubuntu's AppArmor restriction).
+
+Tested with the real Claude in a VM: reads of `~/.claude.json`,
+`~/.gitconfig` and `/run/user`, writes to `.git`, `.claude`, `.envrc` and
+`.husky`, the network and Docker's socket are all refused; project writes
+work; the Read tool is refused outside the project; Bash is refused when
+nobody approves. Claude's sandbox leaves an empty `.git/config.worktree`
+(git ignores it without `extensions.worktreeConfig`; the guard does too) and
+`.claude/.cc-writes` in the project, and may write its own temp directory
+`/tmp/claude-<uid>`.
+
+Not covered: Claude itself (login, API traffic, the model sees what it
+reads), commands reading the rest of the system outside $HOME, and whatever
+you approve.
+
+## Review: `kbx diff`
+
+The host never runs git in a repository the agent can write, so `kbx diff`
+runs git in the sandbox at the working directory, with fsmonitor, external
+diff and textconv off, and untracked files added as intent-to-add in a
+throwaway index (the real index is untouched). `--since-start` diffs against
+the commit `HEAD` was at when the sandbox started, recorded on the host at
+each start. Git prints no colour; the host replaces every control character
+with `?` and colours lines itself, so a file cannot hide lines or drive the
+terminal. It is a view the sandbox produces, not a proof: the agent is root
+there.
 
 ## Clipboard: image paste for all agents
 
@@ -1065,6 +1179,141 @@ Notes:
 
 ---
 
+## Dashboard: `kbx dash`
+
+A terminal dashboard over every kbx sandbox on the host, in the spirit of
+sbx's. `kbx dash` opens it, and so does plain `kbx` on a terminal (without a
+terminal, plain `kbx` still prints the usage). It uses only the standard
+library (`curses`), so kbx still has nothing to install.
+
+sbx's dashboard shows egress policy, approvals and credentials; kbx has none
+of those (see [Non-goals](#non-goals-deliberately-left-out)). Its place goes
+to what kbx does have: the guard, the workspace mode and clone-mode git.
+
+### What it shows
+
+The list has one row per sandbox (`docker ps` on the `kbx.name` label):
+
+| Column | Source |
+| --- | --- |
+| name, project | container name, `kbx.project` label (`~` for `$HOME`) |
+| state | container state; `paused` is highlighted, because the guard pauses |
+| mode | `kbx.workspace` label (`mount`/`clone`) |
+| guard | `ALERT` (alert file pending), `UNGUARDED` (mount mode, running, guard on in the config, no guard process), `watching`, `off` (`[workspace] guard = false`), `-` (clone mode or not running) |
+| sessions | `kbx-session list` in the sandbox (running only) |
+| CPU, memory | `docker stats --no-stream` (running only; `-` if the runtime reports none) |
+| flags | `stale`, `orphan`, `health` (see below) |
+
+The detail pane shows the selected sandbox in sections:
+
+1. **Guard.** Its state in words. With an alert: the `kbx resume` report
+   (the findings and the diffs of the agent's versions) and the keys to resume
+   or accept. When unguarded: why that matters and the key that starts a guard.
+2. **Health.** The `kbx-init status` record: failed seeds, failed `start.sh`
+   and failed services, or "all ok".
+3. **Git.** Mount mode: commits on `HEAD` since the sandbox started (count
+   and the last few subjects) and the number of uncommitted paths. Clone mode:
+   unfetched branches and uncommitted changes and stashes in the clone
+   (`git.unfetched`, `git.local_changes`), with fetch and sync keys.
+4. **Agents.** The installed versions of claude, codex and pi; the latest
+   published version once checked (a key, since it needs the network); whether
+   the Codex remote-control daemon runs and on which version (as `kbx codex`
+   notes, it may run an older Codex than the installed one).
+5. **Staleness.** The image lags the enabled modules or core sources
+   (`image.drift`: build, then recreate); the container was created from an
+   older image than the current one (recreate); the container's mode differs
+   from the config's (recreate switches); the project directory is gone
+   (orphan).
+
+### Actions
+
+Everything that already has a command runs that command: the dashboard ends
+curses, runs `kbx <command>` in the sandbox's project directory, and redraws
+when it exits. So attach and shell hand over the terminal as usual and come
+back to the dashboard on detach, and `kbx rm` and `kbx resume` ask their own
+questions. Commands that print and exit wait for Enter first.
+
+| Key | Runs |
+| --- | --- |
+| Enter | attach: the only live session, else ask which agent (starting it if none runs) |
+| `c` `x` `p` | `kbx claude`, `kbx codex`, `kbx pi` |
+| `s` | `kbx shell` |
+| `S` | `kbx start` (also starts a missing guard) |
+| `t` | `kbx stop` (asks first) |
+| `r` | `kbx recreate` (asks first) |
+| `D` | `kbx rm` (it asks, and lists unfetched work in clone mode) |
+| `R` / `A` | `kbx resume` / `kbx resume --accept` (asks first) |
+| `f` / `y` | `kbx fetch` / `kbx sync` (clone mode) |
+| `u` / `U` | `kbx update` / check the latest published agent versions |
+| `l` | `kbx logs` |
+| `b` | `kbx build` |
+| Tab / ← → | full-screen details / other sandbox there |
+| `g` | refresh now; `?` help; `q` quit |
+
+An orphan (its project directory is gone) cannot run commands, which work
+from the project directory. The dashboard offers stop and remove for it
+directly (container, volumes and guard state, after a typed confirmation).
+
+### Narrow terminals
+
+The dashboard must work in a phone's terminal (Termux, 40-odd columns). The
+layout follows the width: two lines per sandbox below 60 columns; above
+that, a table whose columns take their content's width and drop by priority
+(state, guard, sessions and flags stay longest); details, help and prompts
+wrap rather than cut. Tab shows the details on the whole screen, where ↑ ↓
+scroll (a swipe in Termux sends them) and ← → switch sandboxes; every key
+this needs is on Termux's default extra-keys row.
+
+### Refresh and cost
+
+A `docker exec` into a Kata VM takes a noticeable fraction of a second, so
+the dashboard never runs one per sandbox on every redraw:
+
+- every 2s: `docker ps` + one `docker inspect` for all sandboxes, and the
+  guard's host files (pid, alert). No exec.
+- every 10s, in a background thread: sessions of running sandboxes, and
+  `docker stats`.
+- the selected sandbox only, in the background, when selected and every 15s
+  after: health, git, agent versions and remote control.
+- only on request: the latest published agent versions.
+
+The UI thread never waits for docker; the pane shows `…` until a result
+arrives, and the age of the data it shows.
+
+### Security
+
+- **No host git in a shared checkout.** In mount mode the agent can write
+  `.git/config` and `.gitattributes`: a `git status` from the host runs
+  `core.fsmonitor` and clean filters, and the guard puts them back only after
+  the write. A person running git has the same exposure, but a dashboard
+  polling git every few seconds would run it with no one acting. So all git
+  information in mount mode comes from inside the sandbox (`docker exec git …`
+  at the same path); a stopped sandbox shows none. Clone mode already follows
+  the rule of `kbx/git.py` (host git only in the host's own repository).
+- **Sandbox output is untrusted text.** Commit subjects, branch names, the
+  guard's diffs and status fields come from the agent. Every string is
+  stripped of control characters (C0, C1, DEL) before it reaches the
+  terminal, and cut to the pane width.
+- **The dashboard is not part of the protection.** The launcher still starts
+  the guard; the dashboard only shows when one is missing and offers `kbx
+  start`, which starts it. Closing the dashboard changes nothing.
+- **No listener.** A TUI needs no server, no port and no auth, unlike a web
+  dashboard.
+- The latest-version check contacts `registry.npmjs.org` from the host (for
+  `@anthropic-ai/claude-code`, `@openai/codex` and pi's package), only when
+  asked. The npm version is a stand-in for the native installers' version.
+
+### Code
+
+- `kbx/status.py`: collection, no curses. Dataclasses for a sandbox row and
+  its details, the classification (guard column, flags) as pure functions,
+  and the background refresher. Unit-tested against the fake docker.
+- `kbx/dash.py`: the curses loop, drawing (rendering to lines first, so it is
+  testable without a terminal), keys, confirmations and running commands.
+- `kbx/cli.py`: the `dash` subcommand and plain `kbx` on a terminal.
+
+---
+
 ## Phase 6: tests and docs
 
 - `tests/unit/test_cli.py`, `test_config.py`, `test_sandbox.py`, …: launcher
@@ -1122,6 +1371,7 @@ kbx/                        # its own repository; clone anywhere
 ├── kbx/                    # host package (stdlib only)
 │   ├── cli.py  config.py  modules.py  stage.py  image.py  paths.py (XDG)
 │   ├── sandbox.py  git.py  guard.py  agents.py  session.py  clipd.py
+│   ├── status.py  dash.py                      # the dashboard (`kbx dash`)
 │   └── docker.py
 ├── kbx_sandbox/            # sandbox package (copied into the image)
 │   ├── init.py             # kbx-init: seed, start.sh, supervisor, ready marker

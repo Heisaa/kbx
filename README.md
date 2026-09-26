@@ -37,15 +37,21 @@ kbx claude                                    # or: kbx codex, kbx pi
 ```
 
 The first run creates the sandbox with your checkout mounted at the same path
-and attaches. Log in once inside (`/login` in Claude, `codex login
---device-auth` in `kbx shell`); logins persist in the sandbox's home volume.
+and attaches, skipping the agents' first-run screens (theme picker, folder
+trust). Log in once inside (`/login` in Claude, "Sign in with Device Code" in
+Codex); logins persist in the sandbox's home volume.
 
 Detach with `Ctrl-\` (configurable). The agent keeps running, and so does
-remote control. `kbx claude` or `kbx attach` reattaches.
+remote control. `kbx claude` or `kbx attach` reattaches. While you are
+detached, a desktop notification tells you when an agent finishes a turn or
+waits for an approval. A sandbox with no agent session and no shell for 2 hours
+stops itself to free its memory; the next kbx command starts it again.
 
 The agent's edits and commits show up in your checkout as it makes them, and
-yours show up in the sandbox. Review with `git diff` / `git log -p` before you
-run anything on the host, then push as usual.
+yours show up in the sandbox. Review with `kbx diff` (uncommitted and new
+files; `--since-start` adds the commits made since the sandbox started), which
+runs git in the sandbox rather than on your host, before you run anything on
+the host, then push as usual.
 
 If the agent changes something your tools would run (a git hook, `core.fsmonitor`
 or other git config, `.husky/`, `.pre-commit-config.yaml`, `.vscode/settings.json`),
@@ -71,7 +77,35 @@ change back if it was yours. See [docs/git-workflow.md](docs/git-workflow.md).
 | `kbx build` | build the image from core + enabled modules |
 | `kbx check` | validate config and modules |
 | `kbx seed [--dry-run\|--status\|--reset M]` | manage home defaults |
+| `kbx diff [--stat] [--since-start\|--since REV] [path…]` | the agent's changes, from git in the sandbox, safe to view on the host |
+| `kbx host [-c\|-r [ID]] [--model M] [prompt]` | the exception: Claude Code on the host, locked down, after you confirm; see below |
 | `kbx ls` | list sandboxes and sessions |
+| `kbx` / `kbx dash` | dashboard over all sandboxes: guard alerts, what each agent is doing, health, git, agent versions and logins; runs the commands above |
+
+## When it has to run on the host: `kbx host`
+
+Some tasks a VM cannot do. `kbx host` runs Claude Code on the host itself, as a
+deliberate exception: it shows what the session may do and asks before it
+starts. The session is locked down as far as Claude Code allows. Claude asks
+before every tool use (auto and bypass modes are off), and commands run in its
+OS sandbox (bubblewrap on Linux; it must start or Claude exits). Commands can
+write only the project, never its git directory or hook and editor files, and
+can read nothing in your home outside the project and a few toolchain
+directories. They get no network and no Unix sockets (no Docker, SSH agent or
+D-Bus), and a scrubbed environment without your shell's tokens. The session
+has its own Claude login and history, and ignores your Claude settings, MCP
+servers and plugins. Adjust it in `[host]` ([configuration](docs/configuration.md#host)).
+
+You do not install Claude Code on the host for this. kbx downloads its own copy
+on first use, checks the release signature against Anthropic's key (kept in
+this repository) and the checksum, and keeps it in its data directory, off your
+`PATH`. So there is no `claude` command that runs unsandboxed by mistake. The
+copy never updates itself (Claude's updater would install a regular copy into
+`~/.local/bin`); kbx updates it at launch.
+
+It is still much weaker than a sandbox: same kernel, same user, and Claude
+itself runs unsandboxed with your approval as the main control. Needs
+`bubblewrap`, `socat` and `gpg` on the host.
 
 ## Threat model in short
 
@@ -99,6 +133,7 @@ details: [PLAN.md](PLAN.md#threat-model).
 - [docs/configuration.md](docs/configuration.md): `~/.config/kbx/config.toml`
 - [docs/modules.md](docs/modules.md): module format, seeds, writing your own
 - [docs/git-workflow.md](docs/git-workflow.md): mount mode and the guard, clone mode (fetch/sync), worktrees
+- [docs/dashboard.md](docs/dashboard.md): `kbx dash`, what it shows and its keys
 - [docs/migrating-from-sbx.md](docs/migrating-from-sbx.md): coming from Docker Sandboxes kits
 - [PLAN.md](PLAN.md): design and rationale
 

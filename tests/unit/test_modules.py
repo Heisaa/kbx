@@ -42,11 +42,12 @@ class ModulesTest(TempHome):
                 "codex-reset-fast",
                 "codex-statusline",
                 "node-toolchain",
+                "notify",
                 "playwright",
             },
         )
         resolved = modules.resolve(found, self.cfg())
-        self.assertEqual([r.name for r in resolved], ["clipboard", "codex-chatgpt-auth"])
+        self.assertEqual([r.name for r in resolved], ["clipboard", "codex-chatgpt-auth", "notify"])
         issues = [i for i in modules.check(found, resolved) if i.level == "error"]
         self.assertEqual(issues, [])
 

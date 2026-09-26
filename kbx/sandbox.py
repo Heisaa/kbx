@@ -432,3 +432,22 @@ def sessions(docker: Docker, name: str) -> list[str]:
     except ValueError:
         return []
     return [str(item) for item in data] if isinstance(data, list) else []  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
+
+
+def session_states(docker: Docker, name: str) -> dict[str, str]:
+    """Live sessions and what each is doing (working, waiting, done; "" if unknown).
+
+    Falls back to plain session names on an image without `kbx-session status`.
+    """
+    result = docker.exec(name, ["kbx-session", "status"], check=False, timeout=15)
+    try:
+        data = json.loads(result.stdout) if result.returncode == 0 else None
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return {agent: "" for agent in sessions(docker, name)}
+    states: dict[str, str] = {}
+    for agent, info in data.items():  # pyright: ignore[reportUnknownVariableType]
+        state = info.get("state") if isinstance(info, dict) else None  # pyright: ignore[reportUnknownMemberType]
+        states[str(agent)] = state if state in ("working", "waiting", "done") else ""  # pyright: ignore[reportUnknownArgumentType]
+    return states

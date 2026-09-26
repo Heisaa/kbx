@@ -29,6 +29,9 @@ Each can be overridden for one run with `KBX_<NAME>`, e.g.
 | --- | --- | --- |
 | `auto_update` | `true` | Update the launched agent before starting it (never when reattaching) |
 | `remote_control` | `true` | Claude: `--remote-control`. Codex: login check + `codex remote-control start` |
+| `skip_onboarding` | `true` | Before Claude/Codex launch: mark first-run screens done and trust the working directory (`kbx-onboard`). Login stays yours |
+| `notify` | `"detached"` | Desktop notification (`notify-send`) when an agent finishes a turn or waits for an approval: `"detached"` (only when no terminal shows that session), `"always"`, or `"off"`. Needs the `notify` module |
+| `idle_stop` | `"2h"` | Stop the sandbox after this long with no agent session and no interactive shell (`"90m"`, `"3600"` seconds, or `"off"`). Stopping ends the inner Docker's containers too, and Codex remote control started with `kbx rc-start` while no Codex session is open; set `"off"` if you rely on that |
 | `codex_search` | `true` | Codex: `--search --enable standalone_web_search` |
 | `shared_skills` | `true` | Stage `[skills] sources` and link them as `~/.agents/skills` and `~/.claude/skills` |
 | `detach_key` | `"^\\"` | dtach detach key (`Ctrl-\`). One character, `^X` notation, or `"none"` |
@@ -75,6 +78,26 @@ Each entry of each source directory is a skill (usually a directory with
 `SKILL.md`). Missing directories are skipped; on a name clash the first source
 wins, with a warning. Skills are copied into the stage with symlinks
 dereferenced, so edits show up in running sandboxes at the next launch.
+
+## `[host]`
+
+For `kbx host`, Claude Code on the host. The rest of the policy is fixed; see
+[the README](../README.md#when-it-has-to-run-on-the-host-kbx-host).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `allow_read` | toolchain directories: `~/.local/bin`, `~/.local/lib`, `~/.local/share/mise`, `~/.cargo/bin`, `~/.rustup`, `~/.nvm`, `~/.pyenv`, `~/.volta`, `~/.bun/bin`, `~/.deno/bin`, `~/go/bin`, `~/.sdkman/candidates` | What commands may read in your home besides the project. Setting it replaces the list. A tool whose link points elsewhere in your home (pipx, `~/.local/bin/claude`) needs that target too |
+| `allow_write` | `[]` | Writable besides the project |
+| `allowed_domains` | `[]` | Network for commands (`"pypi.org"`, `"*.npmjs.org"`); none by default |
+| `channel` | `"stable"` | Release channel of kbx's own Claude Code: `"stable"` or `"latest"`. Checked at each launch when `[launcher] auto_update` is on |
+| `env` | `[]` | Environment variables passed through besides `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `COLORTERM`, `TERM_PROGRAM`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ` (e.g. `HTTPS_PROXY`) |
+
+The host session runs kbx's own Claude Code from
+`$XDG_DATA_HOME/kbx/host-claude-bin/<version>/claude` (downloaded on first use,
+never on your `PATH`), keeps its Claude state in
+`$XDG_DATA_HOME/kbx/host-claude/` (log in there once) and its generated
+settings in `$XDG_RUNTIME_DIR/kbx/host-settings-<sandbox>.json`. A Claude Code
+installed on the host is not used.
 
 ## `[modules]` and `[options.<module>]`
 

@@ -42,6 +42,7 @@ RUN = Path("/run/kbx")
 READY = RUN / "ready"
 SERVICES = RUN / "services.json"
 SESSIONS = RUN / "sessions"
+AGENT_STATES = RUN / "agents"  # kbx-notify
 LOG = Path("/var/log/kbx-startup.log")
 SERVICE_LOGS = Path("/var/log/kbx")
 DOCKER_STORE = Path("/var/lib/kbx-docker")
@@ -603,8 +604,9 @@ def boot() -> int:
         log(f"ids: cannot give agent the host user's ids: {exc}")
     agent = User.lookup("agent")
     root = User.lookup("root")
-    SESSIONS.mkdir(mode=0o700, exist_ok=True)
-    chown_agent(SESSIONS, agent)
+    for directory in (SESSIONS, AGENT_STATES):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        chown_agent(directory, agent)
 
     config = load_config()
     fix_dns(config.get("dns") or [])

@@ -115,6 +115,7 @@ more than 5 exits in a minute. `dockerd` is supervised the same way. Status:
 | --- | --- | --- |
 | `clipboard` | on | `build.sh`: Xvfb, python3-xlib, xclip. `service`: Xvfb `:0` + the clipboard bridge. Host side is `kbx`'s clipboard watcher |
 | `codex-chatgpt-auth` | on | Seeds `forced_login_method = "chatgpt"` and `model_provider = "openai"` (enforced). Needed for Codex remote control; turn off to keep API-key auth |
+| `notify` | on | Seeds Claude Code hooks (`UserPromptSubmit`, `PostToolUse`, `Notification`, `Stop`, `SessionEnd`) and Codex's `notify` to run `kbx-notify`, which records what each session does for the host's notifications and the dashboard |
 | `node-toolchain` | off | `build.sh`: a chosen Node (`version`), extra `apt` and global `npm` packages |
 | `playwright` | off | `build.sh`: Playwright + Chromium + a `chromium` wrapper (~500 MB). `[env]` sets the browsers path |
 | `claude-statusline` | off | `~/.claude/statusline.mjs` and the `statusLine` setting |

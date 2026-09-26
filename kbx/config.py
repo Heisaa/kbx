@@ -9,7 +9,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,12 +25,18 @@ _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _IMAGE = re.compile(r"^[a-z0-9][a-z0-9._/:@-]*$")
 _DETACH = re.compile(r"^(\^.|.)$")
 _MODULE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_DURATION = re.compile(r"^([0-9]+)([smhd]?)$")
+_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+NOTIFY = ("detached", "always", "off")
 
 
 @dataclass(frozen=True)
 class LauncherConfig:
     auto_update: bool = True
     remote_control: bool = True
+    skip_onboarding: bool = True
+    notify: str = "detached"  # desktop notifications from agent hooks; see NOTIFY
+    idle_stop: int = 2 * 3600  # seconds without sessions or shells before a stop; 0 = never
     codex_search: bool = True
     shared_skills: bool = True
     detach_key: str = "^\\"
@@ -108,6 +114,36 @@ class SkillsConfig:
     sources: tuple[Path, ...] = ()
 
 
+# `kbx host`: toolchains under $HOME that commands may read (the rest of $HOME is denied).
+HOST_READ = (
+    "~/.local/bin",
+    "~/.local/lib",
+    "~/.local/share/mise",
+    "~/.cargo/bin",
+    "~/.rustup",
+    "~/.nvm",
+    "~/.pyenv",
+    "~/.volta",
+    "~/.bun/bin",
+    "~/.deno/bin",
+    "~/go/bin",
+    "~/.sdkman/candidates",
+)
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_DOMAIN = re.compile(r"^(\*\.)?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
+
+
+@dataclass(frozen=True)
+class HostConfig:
+    """`kbx host`: what the locked-down host session may use besides the project."""
+
+    allow_read: tuple[Path, ...] = ()
+    allow_write: tuple[Path, ...] = ()
+    allowed_domains: tuple[str, ...] = ()  # network for commands; none by default
+    env: tuple[str, ...] = ()  # environment variables passed through, beyond the basic ones
+    channel: str = "stable"  # kbx's own Claude Code: "stable" or "latest"
+
+
 @dataclass(frozen=True)
 class Config:
     launcher: LauncherConfig = field(default_factory=LauncherConfig)
@@ -116,6 +152,7 @@ class Config:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
+    host: HostConfig = field(default_factory=HostConfig)
     modules: Mapping[str, bool] = field(default_factory=dict[str, bool])
     options: Mapping[str, Mapping[str, OptionValue]] = field(default_factory=dict[str, Mapping[str, OptionValue]])
 
@@ -158,6 +195,17 @@ def _str(table: Mapping[str, Any], key: str, default: str, where: str) -> str:
     if not isinstance(value, str):
         raise KbxError(f"{where}.{key} must be a string")
     return value
+
+
+def parse_duration(value: object, where: str) -> int:
+    """A duration: "4h", "90m", "3600" (seconds), or "off"/0 for never."""
+    text = str(value).strip().lower() if isinstance(value, str | int) and not isinstance(value, bool) else None
+    if text in ("off", "never", "0"):
+        return 0
+    match = _DURATION.match(text or "")
+    if match is None:
+        raise KbxError(f'{where} must be a duration like "4h", "90m" or "off"')
+    return int(match.group(1)) * _UNITS[match.group(2)]
 
 
 def _launcher(table: dict[str, Any], env: Mapping[str, str], where: str) -> LauncherConfig:
@@ -203,9 +251,16 @@ def _launcher(table: dict[str, Any], env: Mapping[str, str], where: str) -> Laun
             dns.append(str(ipaddress.ip_address(str(item))))  # pyright: ignore[reportUnknownArgumentType]
         except ValueError:
             raise KbxError(f"{where}.dns: {item!r} is not an IP address") from None
+    notify = _str(table, "notify", defaults.notify, where)
+    if notify not in NOTIFY:
+        raise KbxError(f"{where}.notify must be one of {', '.join(NOTIFY)} (KBX_NOTIFY too)")
+    idle_stop = parse_duration(table.get("idle_stop", defaults.idle_stop), f"{where}.idle_stop (KBX_IDLE_STOP too)")
     return LauncherConfig(
         auto_update=_bool(table, "auto_update", defaults.auto_update, where),
         remote_control=_bool(table, "remote_control", defaults.remote_control, where),
+        skip_onboarding=_bool(table, "skip_onboarding", defaults.skip_onboarding, where),
+        notify=notify,
+        idle_stop=idle_stop,
         codex_search=_bool(table, "codex_search", defaults.codex_search, where),
         shared_skills=_bool(table, "shared_skills", defaults.shared_skills, where),
         detach_key=detach,
@@ -293,6 +348,45 @@ def _skills(table: dict[str, Any], home: Path, where: str) -> SkillsConfig:
     return SkillsConfig(sources=tuple(sources))
 
 
+def _strings(table: Mapping[str, Any], key: str, default: Sequence[str], where: str) -> list[str]:
+    raw: Any = table.get(key, list(default))
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):  # pyright: ignore[reportUnknownVariableType]
+        raise KbxError(f"{where}.{key} must be a list of strings")
+    return list(raw)  # pyright: ignore[reportUnknownArgumentType]
+
+
+def _host_paths(table: Mapping[str, Any], key: str, default: Sequence[str], home: Path, where: str) -> tuple[Path, ...]:
+    result: list[Path] = []
+    for item in _strings(table, key, default, where):
+        path = expand_user(item, home)
+        if not path.is_absolute():
+            raise KbxError(f"{where}.{key}: {item} must be absolute or start with ~/")
+        result.append(path)
+    return tuple(result)
+
+
+def _host(table: dict[str, Any], home: Path, where: str) -> HostConfig:
+    _reject_unknown(table, set(HostConfig.__dataclass_fields__), where)
+    domains = _strings(table, "allowed_domains", (), where)
+    for domain in domains:
+        if not _DOMAIN.match(domain):
+            raise KbxError(f"{where}.allowed_domains: {domain!r} is not a domain (a leading *. is allowed)")
+    names = _strings(table, "env", (), where)
+    for name in names:
+        if not _ENV_NAME.match(name):
+            raise KbxError(f"{where}.env: {name!r} is not an environment variable name")
+    channel = _str(table, "channel", HostConfig.channel, where)
+    if channel not in ("stable", "latest"):
+        raise KbxError(f'{where}.channel must be "stable" or "latest"')
+    return HostConfig(
+        channel=channel,
+        allow_read=_host_paths(table, "allow_read", HOST_READ, home, where),
+        allow_write=_host_paths(table, "allow_write", (), home, where),
+        allowed_domains=tuple(domains),
+        env=tuple(names),
+    )
+
+
 def _modules(table: dict[str, Any], where: str) -> dict[str, bool]:
     result: dict[str, bool] = {}
     for name, value in table.items():
@@ -333,7 +427,7 @@ def load(paths: Paths, env: Mapping[str, str]) -> Config:
 
 
 def parse(data: Mapping[str, Any], paths: Paths, env: Mapping[str, str], where: str) -> Config:
-    sections = {"launcher", "network", "image", "runtime", "workspace", "skills", "modules", "options"}
+    sections = {"launcher", "network", "image", "runtime", "workspace", "skills", "host", "modules", "options"}
     _reject_unknown(data, sections, where)
     return Config(
         launcher=_launcher(_table(data, "launcher", where), env, "[launcher]"),
@@ -342,6 +436,7 @@ def parse(data: Mapping[str, Any], paths: Paths, env: Mapping[str, str], where: 
         runtime=_runtime(_table(data, "runtime", where), env, "[runtime]"),
         workspace=_workspace(_table(data, "workspace", where), env, "[workspace]"),
         skills=_skills(_table(data, "skills", where), paths.home, "[skills]"),
+        host=_host(_table(data, "host", where), paths.home, "[host]"),
         modules=_modules(_table(data, "modules", where), "[modules]"),
         options=_options(_table(data, "options", where), "[options]"),
     )

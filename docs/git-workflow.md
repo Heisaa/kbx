@@ -25,8 +25,14 @@ starts) stay owned by root on the host.
   are shared. There is nothing to fetch. `kbx fetch` and `kbx sync` only reach a
   clone left over from clone mode.
 - **Review before you run.** The agent's edits land in your checkout as it
-  makes them. Look at `git diff` / `git log -p` before running tests, builds or
-  the app on the host. Better, run them in the sandbox.
+  makes them. Look at them before running tests, builds or the app on the
+  host. Better, run them in the sandbox. `kbx diff` shows uncommitted and new
+  files (`--since-start` adds the commits since the sandbox started, `--stat`
+  summarizes). It runs git in the sandbox, so whatever the agent put in
+  `.git/config` or `.gitattributes` never runs on your host, and it shows
+  escape sequences in files as `?` instead of passing them to your terminal.
+  It is a view the sandbox produces: the agent is root there and could make
+  its git lie, so it does not replace the guard.
 - **The agent cannot push.** It has no git credentials. You push from the host.
 - **Untracked files are shared too.** The agent can read `.env` files and other
   secrets in the checkout. The internet is open, so it could send them out. Use

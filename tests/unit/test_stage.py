@@ -35,7 +35,7 @@ class StageTest(TempHome):
         self.assertEqual((root / "skills/review/SKILL.md").read_text(), "v1\n")
         data = json.loads((root / "config.json").read_text())
         names = [m["name"] for m in data["modules"]]
-        self.assertEqual(names, ["clipboard", "codex-chatgpt-auth", "codex-reset-fast", "playwright"])
+        self.assertEqual(names, ["clipboard", "codex-chatgpt-auth", "codex-reset-fast", "notify", "playwright"])
         reset = next(m for m in data["modules"] if m["name"] == "codex-reset-fast")
         self.assertEqual(reset["start"], {"user": "agent", "before_launch": ["codex"]})
         auth = next(m for m in data["modules"] if m["name"] == "codex-chatgpt-auth")

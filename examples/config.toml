@@ -25,6 +25,9 @@
 # Overridable per run as KBX_<NAME>, e.g. KBX_REMOTE_CONTROL=false kbx claude
 # auto_update = true          # update the launched agent before starting it
 # remote_control = true       # Claude: --remote-control; Codex: remote-control start
+# skip_onboarding = true      # Claude/Codex: skip first-run screens, trust the workdir
+# notify = "detached"         # desktop notifications: "detached", "always" or "off"
+# idle_stop = "2h"            # stop after this long without sessions or shells; "off" never
 # codex_search = true         # Codex web search flags
 # shared_skills = true        # stage [skills] sources and link them for the agents
 # detach_key = "^\\"          # dtach detach key (Ctrl-\); "none" disables it
@@ -56,6 +59,14 @@
 #   ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml",
 #   ".lefthook-local.yml", ".lefthook-local.yaml", ".vscode/settings.json",
 #   ".vscode/tasks.json"]      # files host tools run, guarded like hooks
+
+[host]
+# kbx host: Claude Code on the host, locked down. Everything else is fixed.
+# allow_read = ["~/.local/bin", "~/.cargo/bin", …]   # readable in $HOME besides the project
+# allow_write = []            # writable besides the project
+# allowed_domains = []        # network for commands, e.g. ["pypi.org", "*.npmjs.org"]
+# env = []                    # variables passed through, e.g. ["HTTPS_PROXY"]
+# channel = "stable"          # kbx's own Claude Code: "stable" or "latest"
 
 [skills]
 # Directories whose entries are skills; the first source wins on a name clash.

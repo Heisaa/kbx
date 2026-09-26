@@ -73,6 +73,17 @@ class Docker:
         data = json.loads(result.stdout or b"[]")
         return data[0] if data else None
 
+    def inspect_many(self, kind: str, names: Sequence[str]) -> list[dict[str, Any]]:
+        """One call for several objects; missing ones are left out."""
+        if not names:
+            return []
+        result = self.run([kind, "inspect", *names], check=False)
+        try:
+            data = json.loads(result.stdout or b"[]")
+        except ValueError:
+            return []
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []  # pyright: ignore[reportUnknownVariableType]
+
     @staticmethod
     def exec_args(
         name: str,

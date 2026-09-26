@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,10 @@ def load() -> dict[str, Any]:
 
 
 def save(state: dict[str, Any]) -> None:
-    STATE.write_text(json.dumps(state, indent=1))
+    # Atomic: the dashboard tests run several fake dockers at once.
+    temp = STATE.with_name(f"state.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(state, indent=1))
+    os.replace(temp, STATE)
 
 
 def record(args: list[str]) -> None:
@@ -62,12 +66,26 @@ def emulate(state: dict[str, Any], argv: list[str], stdin: bytes) -> int | None:
     if argv[:2] == ["kbx-init", "status"]:
         if not behave.get("ready", True):
             return 1
-        print(json.dumps({"boot_id": "x", "seed": {}, "start": {}, "services": {}}))
+        print(json.dumps(behave.get("ready_record", {"boot_id": "x", "seed": {}, "start": {}, "services": {}})))
         return 0
-    if argv[:1] in (["kbx-init"], ["kbx-seed"], ["tail"]):
+    if argv[:1] in (["kbx-init"], ["kbx-seed"], ["kbx-onboard"], ["tail"]):
         return 0
     if argv[:2] == ["kbx-session", "list"]:
         print(json.dumps(behave.get("sessions", [])))
+        return 0
+    if argv[:2] == ["kbx-session", "status"]:
+        states = behave.get("session_states", {})
+        print(json.dumps({name: states.get(name, {"attached": False}) for name in behave.get("sessions", [])}))
+        return 0
+    if argv == ["kbx-notify", "follow"]:
+        for line in behave.get("follow", []):
+            print(json.dumps(line), flush=True)
+        time.sleep(float(behave.get("follow_hold", 60)))  # a live stream stays open
+        return 0
+    if argv[:1] == ["kbx-login-status"]:
+        logins = behave.get("logins", {})
+        names = argv[1:] or ["claude", "codex", "pi"]
+        print(json.dumps({n: logins.get(n, {"ok": True, "detail": "fake login"}) for n in names}))
         return 0
     if argv[:2] == ["kbx-session", "alive"]:
         return 0 if argv[2] in behave.get("sessions", []) else 1
@@ -92,7 +110,10 @@ def emulate(state: dict[str, Any], argv: list[str], stdin: bytes) -> int | None:
             return 0
         print("Not logged in")
         return 1
-    if argv[:2] in (["codex", "remote-control"], ["codex", "app-server"]):
+    if argv[:2] == ["codex", "app-server"]:
+        print(behave.get("daemon", "daemon running (codex 1.0.0)"))
+        return int(behave.get("daemon_status", 0))
+    if argv[:2] == ["codex", "remote-control"]:
         return 0
     if argv[:1] == ["dtach"] or argv == ["bash", "-l"]:
         # The final attach: record what would run in the terminal.
@@ -156,14 +177,17 @@ def main() -> int:
         return 0
     command = args[0]
     if command == "inspect" or (len(args) > 1 and args[1] == "inspect"):
-        kind, name = (args[0], args[2]) if args[1:2] == ["inspect"] else ("container", args[1])
+        kind, names = (args[0], args[2:]) if args[1:2] == ["inspect"] else ("container", args[1:])
         table = {"container": "containers", "image": "images", "network": "networks", "volume": "volumes"}[kind]
-        item = state[table].get(name)
-        if item is None:
-            print(f"Error: No such {kind}: {name}", file=sys.stderr)
-            return 1
-        print(json.dumps([item]))
-        return 0
+        found = []
+        for name in names:
+            item = state[table].get(name)
+            if item is None:
+                print(f"Error: No such {kind}: {name}", file=sys.stderr)
+                continue
+            found.append({"Name": f"/{name}", **item} if kind == "container" else item)
+        print(json.dumps(found))
+        return 0 if len(found) == len(names) else 1
     if args[:2] == ["network", "create"]:
         name = args[-1]
         bridge = next((a.split("=", 1)[1] for a in args if a.startswith("com.docker.network.bridge.name=")), None)
@@ -176,9 +200,11 @@ def main() -> int:
     if command == "create":
         name = option(args, "--name")
         assert name is not None
+        image = next((state["images"][a] for a in reversed(args) if a in state["images"]), {})
         state["containers"][name] = {
-            "State": {"Status": "created"},
+            "State": {"Status": "created", "StartedAt": "0001-01-01T00:00:00Z"},
             "Config": {"Labels": labels_from(args)},
+            "Image": image.get("Id", ""),
             "Args": args,
         }
         for index, arg in enumerate(args):
@@ -191,6 +217,7 @@ def main() -> int:
     if command == "start":
         container = state["containers"][args[1]]
         container["State"]["Status"] = "running"
+        container["State"]["StartedAt"] = state.get("behave", {}).get("started_at", "2020-01-01T00:00:00.123456789Z")
         container["Starts"] = container.get("Starts", 0) + 1
         save(state)
         return 0
@@ -218,7 +245,9 @@ def main() -> int:
     if command == "build":
         tag = option(args, "-t")
         assert tag is not None
-        state["images"][tag] = {"Config": {"Labels": labels_from(args)}}
+        builds = state.get("builds", 0) + 1
+        state["builds"] = builds
+        state["images"][tag] = {"Id": f"sha256:build{builds}", "Config": {"Labels": labels_from(args)}}
         dockerfile = option(args, "-f")
         if dockerfile:
             (ROOT / "Dockerfile.last").write_text(Path(dockerfile).read_text())
@@ -231,6 +260,12 @@ def main() -> int:
                 print(f"{name}\t{container['State']['Status']}\t{labels.get('kbx.project', '')}")
         return 0
     if command == "logs":
+        return 0
+    if command == "stats":
+        usage = state.get("behave", {}).get("stats", {})
+        for name in args[1:]:
+            if name in usage:
+                print(f"{name}\t{usage[name][0]}\t{usage[name][1]} / 8GiB")
         return 0
     if command == "exec":
         return do_exec(state, args)
