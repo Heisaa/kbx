@@ -74,6 +74,7 @@ change back if it was yours. See [docs/git-workflow.md](docs/git-workflow.md).
 | `kbx sync` | clone mode: host branches → sandbox `refs/remotes/host/*` |
 | `kbx update` | update all agents now |
 | `kbx rc-start` | start Codex remote control without the TUI |
+| `kbx rc-pair` | start Codex remote control and print a pairing code |
 | `kbx logs` | startup, dockerd and module logs |
 | `kbx stop` / `recreate` / `rm` | lifecycle; `recreate` keeps volumes (and switches mode), `rm` asks (clone mode: lists unfetched work) |
 | `kbx build` | build the image from core + enabled modules |

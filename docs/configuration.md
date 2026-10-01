@@ -28,7 +28,7 @@ Each can be overridden for one run with `KBX_<NAME>`, e.g.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `auto_update` | `true` | Update the launched agent before starting it (never when reattaching) |
-| `remote_control` | `true` | Claude: `--remote-control`. Codex: login check + `codex remote-control start` |
+| `remote_control` | `true` | Claude: `--remote-control`. Codex: login check + `codex remote-control start`, and the project is registered with the daemon so remote threads open in it |
 | `skip_onboarding` | `true` | Before Claude/Codex launch: mark first-run screens done and trust the working directory (`kbx-onboard`). Login stays yours |
 | `notify` | `"detached"` | Desktop notification (`notify-send`) when an agent finishes a turn or waits for an approval: `"detached"` (only when no terminal shows that session), `"always"`, or `"off"`. Needs the `notify` module |
 | `idle_stop` | `"2h"` | Stop the sandbox after this long with no agent session and no interactive shell (`"90m"`, `"3600"` seconds, or `"off"`). Stopping ends the inner Docker's containers too, and Codex remote control started with `kbx rc-start` while no Codex session is open; set `"off"` if you rely on that |

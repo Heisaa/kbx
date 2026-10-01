@@ -128,7 +128,7 @@ def run_before_launch(docker: Docker, sandbox: Sandbox, agent: Agent, resolved: 
             print(f"⚠ {item.name}: start.sh failed before launching {agent.name}", file=sys.stderr)
 
 
-def codex_remote_control(docker: Docker, sandbox: Sandbox) -> None:
+def codex_remote_control(docker: Docker, sandbox: Sandbox) -> bool:
     """Start Codex remote control if logged in with ChatGPT; warn otherwise."""
     status = docker.exec(sandbox.name, ["codex", "login", "status"], check=False, timeout=60)
     output = (status.stdout + status.stderr).decode("utf-8", "replace")
@@ -136,7 +136,7 @@ def codex_remote_control(docker: Docker, sandbox: Sandbox) -> None:
         print("→ Codex remote control needs a ChatGPT login. Once, inside the sandbox:")
         print("    kbx shell   then   codex login --device-auth")
         print("  (enable MFA on the ChatGPT account first, or enrollment fails with HTTP 403)")
-        return
+        return False
     print("→ Starting Codex remote control…")
     start = docker.exec_passthrough(sandbox.name, ["codex", "remote-control", "start"], timeout=120)
     if start != 0:
@@ -144,8 +144,132 @@ def codex_remote_control(docker: Docker, sandbox: Sandbox) -> None:
             "⚠ Codex remote control could not start; continuing with local Codex. Check login, MFA and network access.",
             file=sys.stderr,
         )
-        return
+        return False
     _daemon_version_note(docker, sandbox)
+    _codex_project(docker, sandbox)
+    return True
+
+
+# Registers the workdir as a project with the remote-control daemon, so a
+# paired client opens new threads there instead of ~/Documents/Codex. The
+# daemon's control socket speaks the app-server protocol over WebSocket.
+CODEX_PROJECT_SCRIPT = r"""
+import base64, json, os, socket, struct, sys
+
+workdir = sys.argv[1]
+home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+sock = socket.socket(socket.AF_UNIX)
+sock.settimeout(30)
+sock.connect(os.path.join(home, "app-server-control", "app-server-control.sock"))
+key = base64.b64encode(os.urandom(16)).decode()
+sock.sendall(
+    f"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+    f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode()
+)
+buffer = b""
+while b"\r\n\r\n" not in buffer:
+    chunk = sock.recv(4096)
+    if not chunk:
+        sys.exit("the app-server socket closed during the handshake")
+    buffer += chunk
+head, _, buffer = buffer.partition(b"\r\n\r\n")
+if b" 101 " not in head.split(b"\r\n")[0]:
+    sys.exit(head.split(b"\r\n")[0].decode(errors="replace"))
+
+
+def read(count):
+    global buffer
+    while len(buffer) < count:
+        chunk = sock.recv(65536)
+        if not chunk:
+            sys.exit("the app-server socket closed")
+        buffer += chunk
+    data, buffer = buffer[:count], buffer[count:]
+    return data
+
+
+def frame(opcode, payload):
+    mask = os.urandom(4)
+    size = len(payload)
+    if size < 126:
+        header = struct.pack("!BB", 0x80 | opcode, 0x80 | size)
+    elif size < 65536:
+        header = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, size)
+    else:
+        header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, size)
+    sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+
+def receive():
+    message = b""
+    while True:
+        first, second = read(2)
+        size = second & 0x7F
+        if size == 126:
+            size = struct.unpack("!H", read(2))[0]
+        elif size == 127:
+            size = struct.unpack("!Q", read(8))[0]
+        mask = read(4) if second & 0x80 else None
+        payload = read(size)
+        if mask:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        opcode = first & 0x0F
+        if opcode == 0x8:
+            sys.exit("the app-server closed the connection")
+        if opcode == 0x9:
+            frame(0xA, payload)
+            continue
+        if opcode in (0x0, 0x1, 0x2):
+            message += payload
+            if first & 0x80:
+                return json.loads(message)
+
+
+def send(message):
+    frame(0x1, json.dumps(message).encode())
+
+
+def call(ident, method, params):
+    send({"id": ident, "method": method, "params": params})
+    while True:
+        message = receive()
+        if message.get("id") == ident:
+            if "error" in message:
+                sys.exit(f"{method}: {message['error'].get('message')}")
+            return message["result"]
+
+
+call(1, "initialize", {"clientInfo": {"name": "kbx", "version": "0"}, "capabilities": {"experimentalApi": True}})
+send({"method": "initialized"})
+cursor, ident = None, 2
+while True:
+    page = call(ident, "project/list", {"cursor": cursor})
+    ident += 1
+    if any(root.get("path") == workdir for project in page["data"] for root in project.get("roots", [])):
+        break
+    cursor = page.get("nextCursor")
+    if not cursor:
+        name = os.path.basename(workdir.rstrip("/")) or workdir
+        call(ident, "project/create", {"idempotencyKey": f"kbx:{workdir}", "name": name, "roots": [{"path": workdir}]})
+        print(f"→ Added {workdir} as a Codex project for remote control")
+        break
+frame(0x8, b"")
+sock.close()
+"""
+
+
+def _codex_project(docker: Docker, sandbox: Sandbox) -> None:
+    result = docker.exec(
+        sandbox.name, ["python3", "-c", CODEX_PROJECT_SCRIPT, sandbox.workdir], check=False, timeout=60
+    )
+    sys.stdout.write(result.stdout.decode("utf-8", "replace"))
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
+        print(
+            f"⚠ could not add {sandbox.workdir} as a Codex project ({detail[-1] if detail else 'no output'}); "
+            "remote threads may open in ~/Documents/Codex",
+            file=sys.stderr,
+        )
 
 
 def _daemon_version_note(docker: Docker, sandbox: Sandbox) -> None:

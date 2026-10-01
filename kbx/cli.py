@@ -36,6 +36,7 @@ kbx fetch [branch…]                 clone mode: sandbox branches → host refs
 kbx sync                            clone mode: host branches → sandbox refs/remotes/host/*
 kbx update                          update all agents without launching
 kbx rc-start                        start Codex remote control without the TUI
+kbx rc-pair                         start Codex remote control and print a pairing code
 kbx logs                            startup, dockerd and module logs
 kbx stop | recreate | rm            lifecycle (rm asks before deleting volumes)
 kbx build                           generate the Dockerfile and build the image
@@ -340,6 +341,13 @@ def cmd_rc_start(ctx: Context, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rc_pair(ctx: Context, args: argparse.Namespace) -> int:
+    sb = prepare(ctx)
+    if not agents.codex_remote_control(ctx.docker, sb):
+        return 1
+    return ctx.docker.exec_passthrough(sb.name, ["codex", "remote-control", "pair"], timeout=60)
+
+
 LOGS_SCRIPT = r"""
 for f in /var/log/kbx-startup.log /var/log/dockerd.log /var/log/kbx/*.log; do
   [ -f "$f" ] || continue
@@ -596,6 +604,7 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("sync", help="host branches → sandbox refs/remotes/host/*")
     sub.add_parser("update", help="update all agents")
     sub.add_parser("rc-start", help="start Codex remote control")
+    sub.add_parser("rc-pair", help="start Codex remote control and print a pairing code")
     logs = sub.add_parser("logs", help="show logs")
     logs.add_argument("-n", "--lines", type=int, default=40)
     sub.add_parser("stop", help="stop the sandbox")
@@ -636,6 +645,7 @@ COMMANDS = {
     "sync": cmd_sync,
     "update": cmd_update,
     "rc-start": cmd_rc_start,
+    "rc-pair": cmd_rc_pair,
     "logs": cmd_logs,
     "stop": cmd_stop,
     "recreate": cmd_recreate,
