@@ -1,8 +1,8 @@
 # Only uncommented keys are seeded; comments alone seed nothing.
 # model = "gpt-5-codex"
 # model_reasoning_effort = "high"
-# approval_policy = "never"
-# sandbox_mode = "danger-full-access"   # the kbx VM is the sandbox
+# Full permissions are already seeded by the built-in agent-permissions module.
+# Disable that module before seeding permission keys here.
 #
 # [features]
 # fast_mode = false                     # remove the /fast toggle entirely

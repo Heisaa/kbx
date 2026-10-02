@@ -41,6 +41,11 @@ and attaches, skipping the agents' first-run screens (theme picker, folder
 trust). Log in once inside (`/login` in Claude, "Sign in with Device Code" in
 Codex); logins persist in the sandbox's home volume.
 
+Claude and Codex default to full permissions inside the VM, which provides the
+isolation. The built-in `agent-permissions` module seeds these defaults;
+explicit settings you have already chosen inside a sandbox are preserved.
+See [configuration](docs/configuration.md#modules-and-optionsmodule) to customize them.
+
 Detach with `Ctrl-\` (configurable). The agent keeps running, and so does
 remote control. `kbx claude` or `kbx attach` reattaches. While you are
 detached, a desktop notification tells you when an agent finishes a turn or

@@ -116,6 +116,21 @@ npm = "typescript pnpm"
 parts it has. Options are validated against the module's `pattern`/`enum`
 before anything runs. See [modules.md](modules.md).
 
+The built-in `agent-permissions` module is enabled by default. It seeds Codex's
+`approval_policy = "never"` and `sandbox_mode = "danger-full-access"`, and
+Claude's `permissions.defaultMode = "bypassPermissions"`. The VM provides
+isolation. These are defaults, so existing explicit settings and later edits
+inside the sandbox are preserved. They apply at sandbox start and before a
+new agent launch; reattaching an existing session does not change its mode.
+`kbx host` uses its own restricted settings.
+
+To supply permission defaults through your own module, disable
+`agent-permissions` under `[modules]` first to avoid seed conflicts. Disabling
+it stops seeding; it does not remove settings already written to a sandbox.
+To apply the full-access defaults to an existing sandbox that has explicit
+permission settings, use `kbx seed --reset agent-permissions --yes`, then
+start a new agent session.
+
 ## Environment variables
 
 | Variable | Effect |

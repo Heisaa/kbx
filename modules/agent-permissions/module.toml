@@ -1,0 +1,2 @@
+description = "Full permissions for Claude and Codex inside the isolated VM"
+default = true

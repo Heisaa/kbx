@@ -36,6 +36,7 @@ class ModulesTest(TempHome):
         self.assertEqual(
             set(found),
             {
+                "agent-permissions",
                 "claude-statusline",
                 "clipboard",
                 "codex-chatgpt-auth",
@@ -47,7 +48,7 @@ class ModulesTest(TempHome):
             },
         )
         resolved = modules.resolve(found, self.cfg())
-        self.assertEqual([r.name for r in resolved], ["clipboard", "codex-chatgpt-auth", "notify"])
+        self.assertEqual([r.name for r in resolved], ["agent-permissions", "clipboard", "codex-chatgpt-auth", "notify"])
         issues = [i for i in modules.check(found, resolved) if i.level == "error"]
         self.assertEqual(issues, [])
 

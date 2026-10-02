@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import tomllib
 
 from kbx import config, modules, paths, stage
+from kbx_sandbox import seed
 from tests.unit.helpers import TempHome
 
 
@@ -35,7 +37,9 @@ class StageTest(TempHome):
         self.assertEqual((root / "skills/review/SKILL.md").read_text(), "v1\n")
         data = json.loads((root / "config.json").read_text())
         names = [m["name"] for m in data["modules"]]
-        self.assertEqual(names, ["clipboard", "codex-chatgpt-auth", "codex-reset-fast", "notify", "playwright"])
+        self.assertEqual(
+            names, ["agent-permissions", "clipboard", "codex-chatgpt-auth", "codex-reset-fast", "notify", "playwright"]
+        )
         reset = next(m for m in data["modules"] if m["name"] == "codex-reset-fast")
         self.assertEqual(reset["start"], {"user": "agent", "before_launch": ["codex"]})
         auth = next(m for m in data["modules"] if m["name"] == "codex-chatgpt-auth")
@@ -55,6 +59,37 @@ class StageTest(TempHome):
         self.assertEqual(before, after)
         self.assertEqual((root / "skills/review/SKILL.md").read_text(), "v2\n")
         self.assertTrue((root / "skills/new/SKILL.md").is_file())
+
+    def test_permission_defaults_seed_before_each_agent_launch(self) -> None:
+        self.restage()
+        home = self.temp / "sandbox-home"
+        home.mkdir()
+        for prefix in (".claude/", ".codex/"):
+            self.assertEqual(
+                seed.main(["--stage", str(self.paths.stage), "--home", str(home), "--only-prefix", prefix, "--quiet"]),
+                0,
+            )
+        claude = json.loads((home / ".claude/settings.json").read_text())
+        self.assertEqual(claude["permissions"]["defaultMode"], "bypassPermissions")
+        codex = tomllib.loads((home / ".codex/config.toml").read_text())
+        self.assertEqual(codex["approval_policy"], "never")
+        self.assertEqual(codex["sandbox_mode"], "danger-full-access")
+        self.assertEqual(codex["forced_login_method"], "chatgpt")
+
+    def test_permission_defaults_preserve_existing_settings(self) -> None:
+        self.restage()
+        home = self.temp / "sandbox-home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".codex").mkdir()
+        (home / ".claude/settings.json").write_text('{"permissions": {"defaultMode": "plan"}, "model": "opus"}')
+        (home / ".codex/config.toml").write_text('sandbox_mode = "workspace-write"\n')
+        self.assertEqual(seed.main(["--stage", str(self.paths.stage), "--home", str(home), "--quiet"]), 0)
+        claude = json.loads((home / ".claude/settings.json").read_text())
+        self.assertEqual(claude["permissions"]["defaultMode"], "plan")
+        self.assertEqual(claude["model"], "opus")
+        codex = tomllib.loads((home / ".codex/config.toml").read_text())
+        self.assertEqual(codex["sandbox_mode"], "workspace-write")
+        self.assertEqual(codex["approval_policy"], "never")
 
     def test_removed_files_disappear(self) -> None:
         self.restage("[modules]\nclaude-statusline = true\n")

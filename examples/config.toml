@@ -4,6 +4,7 @@
 
 [modules]
 # Override each module's own default (see `kbx check` for the list).
+# agent-permissions = true    # Claude/Codex full access inside the VM (on by default)
 # clipboard = true            # image paste for all agents (on by default)
 # codex-chatgpt-auth = true   # Codex uses ChatGPT login (needed for remote control)
 # node-toolchain = false
