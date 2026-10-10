@@ -418,9 +418,9 @@ class CliTest(TempHome):
 
     def test_clipboard_tools_missing_warns_once(self) -> None:
         _, first = self.tty("claude", env={"PATH": self.env["PATH"]})
-        self.assertIn("image paste is off", first)
+        self.assertIn("clipboard sync is off", first)
         _, second = self.tty("claude")
-        self.assertNotIn("image paste is off", second)
+        self.assertNotIn("clipboard sync is off", second)
 
     def test_errors_are_one_line(self) -> None:
         config = self.home / ".config/kbx/config.toml"

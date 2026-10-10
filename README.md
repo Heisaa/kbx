@@ -49,8 +49,9 @@ See [configuration](docs/configuration.md#modules-and-optionsmodule) to customiz
 Detach with `Ctrl-\` (configurable). The agent keeps running, and so does
 remote control. `kbx claude` or `kbx attach` reattaches. While you are
 detached, a desktop notification tells you when an agent finishes a turn or
-waits for an approval. A sandbox with no agent session and no shell for 2 hours
-stops itself to free its memory; the next kbx command starts it again.
+waits for an approval. A sandbox stops itself to free its memory 5 minutes
+after its last agent session and shell close; the next kbx command starts it
+again.
 
 The agent's edits and commits show up in your checkout as it makes them, and
 yours show up in the sandbox. Build directories are the exception: the sandbox

@@ -31,11 +31,13 @@ Each can be overridden for one run with `KBX_<NAME>`, e.g.
 | `remote_control` | `true` | Claude: `--remote-control`. Codex: login check + `codex remote-control start`, and the project is registered with the daemon so remote threads open in it |
 | `skip_onboarding` | `true` | Before Claude/Codex launch: mark first-run screens done and trust the working directory (`kbx-onboard`). Login stays yours |
 | `notify` | `"detached"` | Desktop notification (`notify-send`) when an agent finishes a turn or waits for an approval: `"detached"` (only when no terminal shows that session), `"always"`, or `"off"`. Needs the `notify` module |
-| `idle_stop` | `"2h"` | Stop the sandbox after this long with no agent session and no interactive shell (`"90m"`, `"3600"` seconds, or `"off"`). Stopping ends the inner Docker's containers too, and Codex remote control started with `kbx rc-start` while no Codex session is open; set `"off"` if you rely on that |
+| `idle_stop` | `"5m"` | Stop the sandbox after this long with no agent session and no interactive shell (`"90m"`, `"3600"` seconds, or `"off"`). The short default stops a sandbox soon after you close its last session (a detached session keeps it running) and leaves time to open another. Stopping ends the inner Docker's containers too, and Codex remote control started with `kbx rc-start` while no Codex session is open; set `"off"` if you rely on that |
 | `codex_search` | `true` | Codex: `--search --enable standalone_web_search` |
 | `shared_skills` | `true` | Stage `[skills] sources` and link them as `~/.agents/skills` and `~/.claude/skills` |
 | `detach_key` | `"^\\"` | dtach detach key (`Ctrl-\`). One character, `^X` notation, or `"none"` |
 | `memory` / `cpus` | `"8g"` / `4` | VM size, applied at create (`kbx recreate` to change) |
+| `memory_budget` | `"auto"` | Auto: before a VM starts, compare its limit plus base VM RAM with the host RAM free now, keeping at least 4 GiB or 20% (whichever is larger) for the desktop. kbx refuses only if the VM could not boot, and warns if it could not grow to its limit. A size such as `"20g"` also caps the total stored limits of all active VMs (the worst case); `"off"` disables the RAM check |
+| `shm_budget` | `"auto"` | The same check against free `/dev/shm`, keeping at least 512 MiB or 10% of the mount free. Skipped when the standard Kata config selects Cloud Hypervisor. A size caps the larger of the total VM limits and current `/dev/shm` use plus the new VM; `"off"` disables this check |
 | `dns` | `["1.1.1.1", "9.9.9.9"]` | Resolvers passed to the container |
 | `debug` | `false` | `claude --debug`. `KBX_DEBUG=1` also prints tracebacks for kbx errors |
 | `docker_disk` | `"64g"` | Size of the sparse ext4 image backing the inner Docker (grows, never shrinks) |
@@ -54,8 +56,25 @@ Each can be overridden for one run with `KBX_<NAME>`, e.g.
 | --- | --- | --- |
 | `image.name` | `"kbx-agent"` | Image `kbx build` produces and sandboxes use (`KBX_IMAGE` overrides) |
 | `runtime.name` | `"kata"` | Docker runtime name from `daemon.json` (`KBX_RUNTIME` overrides). `runc` works for development but is **not isolated** |
+| `runtime.memory_overhead` | `"2g"` | Base VM RAM added to each container's stored Docker memory limit for admission. Raise this for a custom Kata configuration/runtime with a larger base VM. kbx also reads `default_memory` from the standard Kata config and uses the larger value |
 | `runtime.privileges` | `"caps"` | Explicit capabilities for the inner dockerd. `"privileged"` does not work under Kata 4 (its agent cannot recreate the host device list), but does under `runc` (risk R1) |
 | `runtime.docker_storage` | `"loop"` | A sparse ext4 image on the volume, loop-mounted as dockerd's data root (overlayfs cannot use Kata's virtio-fs volume as its upper layer). `"volume"` uses the volume directly, which works under `runc` (risk R2) |
+
+Starts across projects are serialized through `$XDG_RUNTIME_DIR/kbx/start.lock`
+(or the normal runtime directory fallback). Guest memory is allocated lazily, so
+running VMs are charged by what they have already touched, which host free RAM
+and `/dev/shm` already reflect, not by their limits. Reattaching to a running
+sandbox runs no check. An explicit budget size counts every running, paused and
+restarting VM container on the daemon, including VMs outside kbx, by its stored
+Docker memory limit; VM containers without a positive limit then block
+admission. Native `runc` containers are never counted as VMs.
+
+Admission is supported for a local Docker Unix socket. The lock coordinates
+launches by the same user with the same kbx runtime directory; direct Docker
+starts, other users, and later allocations by unrelated host applications are
+outside that coordination. Disabling both budgets also disables admission.
+See [host memory setup](host-setup.md#vm-memory-and-the-desktop) for hypervisor
+selection and verification.
 
 ## `[workspace]`
 

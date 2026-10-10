@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -95,11 +96,14 @@ def owner(name: str) -> bool:
     from Xlib import display
 
     connection = display.Display(name)
-    return bool(connection.get_selection_owner(connection.intern_atom("CLIPBOARD")))
+    try:
+        return bool(connection.get_selection_owner(connection.intern_atom("CLIPBOARD")))
+    finally:
+        connection.close()
 
 
 @unittest.skipUnless(HAVE_XLIB and shutil.which("Xvfb"), "needs python3-xlib and Xvfb")
-class BridgeTest(unittest.TestCase):
+class BridgeBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         read_fd, write_fd = os.pipe()
@@ -143,6 +147,8 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+
+class BridgeTest(BridgeBase):
     def test_small_image_round_trips(self) -> None:
         self.push(SMALL)
         value = self.call("image/png")
@@ -204,6 +210,155 @@ class BridgeTest(unittest.TestCase):
         )
         self.assertNotEqual(text.returncode, 0)
         self.assertEqual(text.stdout, b"")
+
+
+def text_owner(name: str, commands: Any) -> None:
+    """Keep one owner window, like Codex's persistent arboard clipboard."""
+    from Xlib import display
+
+    from kbx_sandbox import bridge
+
+    connection = display.Display(name)
+    clipboard = bridge.Clipboard(connection, bridge.FileSource(Path("/unused")))
+    clipboard.atoms[bridge.PNG] = connection.intern_atom("UTF8_STRING")
+    commands.send("ready")
+    while True:
+        while connection.pending_events():
+            clipboard.dispatch(connection.next_event())
+        readable, _, _ = select.select([connection, commands], [], [], 0.1)
+        if commands in readable:
+            clipboard.data = commands.recv()
+            clipboard.own()
+            commands.send("copied")
+
+
+@unittest.skipUnless(real_xclip(), "needs xclip")
+class ExportTest(BridgeBase):
+    def setUp(self) -> None:
+        self.start_export()
+        self.addCleanup(self.close_export)
+        parent, child = multiprocessing.Pipe()
+        self.commands = parent
+        context = multiprocessing.get_context("spawn")
+        self.writer = context.Process(target=text_owner, args=(self.name, child))
+        self.writer.start()
+        child.close()
+        self.addCleanup(self.close_writer)
+        self.assertTrue(parent.poll(5))
+        self.assertEqual(parent.recv(), "ready")
+
+    def start_export(self) -> None:
+        self.export = subprocess.Popen(
+            [sys.executable, "-m", "kbx_sandbox.clip_export"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(os.environ, DISPLAY=self.name, PATH=f"/usr/bin:{os.environ.get('PATH', '')}"),
+        )
+        assert self.export.stdout is not None
+        self.assertTrue(select.select([self.export.stdout], [], [], 5)[0], "export did not start")
+        self.assertEqual(self.export.stdout.readline(), b"\n")
+
+    def close_export(self) -> None:
+        if self.export.stdin is not None and not self.export.stdin.closed:
+            self.export.stdin.close()
+        try:
+            self.export.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            self.export.kill()
+            self.export.wait()
+        if self.export.stdout is not None:
+            self.export.stdout.close()
+        if self.export.stderr is not None:
+            self.export.stderr.close()
+
+    def close_writer(self) -> None:
+        self.writer.terminate()
+        self.writer.join(5)
+        self.commands.close()
+
+    def copy(self, data: bytes) -> None:
+        self.commands.send(data)
+        self.assertTrue(self.commands.poll(5))
+        self.assertEqual(self.commands.recv(), "copied")
+
+    def receive(self) -> bytes:
+        assert self.export.stdout is not None
+        self.assertTrue(select.select([self.export.stdout], [], [], 8)[0], "no exported copy")
+        return base64.b64decode(self.export.stdout.readline().rstrip(b"\n"), validate=True)
+
+    def test_unicode_multiline_and_repeated_owner_copies(self) -> None:
+        for data in ("Hello\n世界 🚀\n".encode(), b"second copy", b"second copy"):
+            self.copy(data)
+            self.assertEqual(self.receive(), data)
+
+    def test_large_text_uses_incr(self) -> None:
+        data = b"large text\n" * 20000
+        self.copy(data)
+        self.assertEqual(self.receive(), data)
+
+    def test_image_push_is_not_exported_as_text(self) -> None:
+        self.push(SMALL)
+        assert self.export.stdout is not None
+        self.assertFalse(select.select([self.export.stdout], [], [], 0.3)[0])
+        self.copy(b"after image")
+        self.assertEqual(self.receive(), b"after image")
+        self.push(None)
+        # A host clear must not release the agent's text ownership.
+        self.assertTrue(owner(self.name))
+
+    def test_no_replay_on_attach_and_eof_stops_listener(self) -> None:
+        self.copy(b"old copy")
+        self.assertEqual(self.receive(), b"old copy")
+        self.close_export()
+        self.start_export()
+        assert self.export.stdout is not None and self.export.stdin is not None
+        self.assertFalse(select.select([self.export.stdout], [], [], 0.3)[0])
+        self.export.stdin.close()
+        self.assertEqual(self.export.wait(timeout=5), 0)
+
+    def test_oversized_and_invalid_utf8_are_ignored(self) -> None:
+        from kbx_sandbox.clip_export import MAX_TEXT
+
+        for data in (b"x" * (MAX_TEXT + 1), b"\xffinvalid"):
+            self.copy(data)
+            assert self.export.stdout is not None
+            self.assertFalse(select.select([self.export.stdout], [], [], 0.5)[0])
+        self.copy(b"valid after rejection")
+        self.assertEqual(self.receive(), b"valid after rejection")
+
+    def test_text_reaches_a_separate_host_clipboard(self) -> None:
+        from unittest import mock
+
+        from kbx import clipd
+
+        read_fd, write_fd = os.pipe()
+        host = subprocess.Popen(
+            ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", "1x1x24", "-nolisten", "tcp", "-noreset"],
+            pass_fds=(write_fd,),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.close(write_fd)
+        with os.fdopen(read_fd) as pipe:
+            host_name = ":" + pipe.readline().strip()
+        try:
+            data = "Selected text\n世界 🚀\n".encode()
+            self.copy(data)
+            record = base64.b64encode(self.receive())
+            with mock.patch.dict(os.environ, DISPLAY=host_name, PATH=f"/usr/bin:{os.environ.get('PATH', '')}"):
+                clipd.copy_record(clipd.Watcher("x11"), record)
+                result = subprocess.run(
+                    [real_xclip() or "xclip", "-selection", "clipboard", "-target", "UTF8_STRING", "-out"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, data)
+        finally:
+            host.terminate()
+            host.wait(timeout=5)
 
 
 class ClipPutTest(unittest.TestCase):

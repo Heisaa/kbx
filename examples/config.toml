@@ -28,11 +28,13 @@
 # remote_control = true       # Claude: --remote-control; Codex: remote-control start
 # skip_onboarding = true      # Claude/Codex: skip first-run screens, trust the workdir
 # notify = "detached"         # desktop notifications: "detached", "always" or "off"
-# idle_stop = "2h"            # stop after this long without sessions or shells; "off" never
+# idle_stop = "5m"            # stop after this long without sessions or shells; "off" never
 # codex_search = true         # Codex web search flags
 # shared_skills = true        # stage [skills] sources and link them for the agents
 # detach_key = "^\\"          # dtach detach key (Ctrl-\); "none" disables it
 # memory = "8g"               # VM size, applied at create (`kbx recreate` to change)
+# memory_budget = "auto"      # refuse if a VM cannot boot in free RAM, warn if it cannot grow
+# shm_budget = "auto"         # the same for /dev/shm (QEMU); "12g" caps total VM limits, "off"
 # cpus = 4
 # dns = ["1.1.1.1", "9.9.9.9"]
 # debug = false               # claude --debug
@@ -48,6 +50,7 @@
 
 [runtime]
 # name = "kata"               # Docker runtime name registered in daemon.json
+# memory_overhead = "2g"      # base VM RAM added to every container limit; raise for custom runtimes
 # privileges = "caps"         # "privileged" fails under Kata 4 (risk R1)
 # docker_storage = "loop"     # or "volume" (runc only: overlayfs fails on virtio-fs) (risk R2)
 

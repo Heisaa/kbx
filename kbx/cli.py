@@ -108,7 +108,7 @@ def prepare(ctx: Context, *, seed_clone: bool = True) -> Sandbox:
     starting = sandbox.state(ctx.docker, sb) not in ("running", "paused")
     if guarded(ctx, sb) and starting:
         guard.before_start(ctx.paths, sb, ctx.config.workspace.protect)
-    sandbox.ensure_running(ctx.docker, sb)
+    sandbox.ensure_running(ctx.docker, sb, config=ctx.config, paths=ctx.paths)
     if guarded(ctx, sb):  # before anything below can fail and leave it unwatched
         guard.ensure(ctx.paths, sb, ctx.docker, ENTRY, ctx.config.workspace.protect)
     elif sb.mode == "mount":
@@ -145,7 +145,7 @@ def _clipboard(ctx: Context, sb: Sandbox) -> None:
     if clipd.backend(ctx.env) is None:
         marker = ctx.paths.runtime_dir / "clipboard-warned"
         if not marker.exists():
-            warn(f"image paste is off: {clipd.missing_tools_hint(ctx.env)} on the host")
+            warn(f"clipboard sync is off: {clipd.missing_tools_hint(ctx.env)} on the host")
             try:
                 ctx.paths.runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 marker.touch()
@@ -155,7 +155,7 @@ def _clipboard(ctx: Context, sb: Sandbox) -> None:
     try:
         clipd.register(ctx.paths, sb.name, os.getpid(), ENTRY)
     except OSError as exc:
-        warn(f"image paste is off: cannot start the clipboard watcher ({exc})")
+        warn(f"clipboard sync is off: cannot start the clipboard watcher ({exc})")
 
 
 def _attach(ctx: Context, sb: Sandbox, agent: str, inner: Sequence[str]) -> None:
@@ -319,7 +319,7 @@ def existing_or_start(ctx: Context) -> Sandbox:
             )
         return sb
     stage.build(ctx.paths, ctx.config, ctx.resolved)
-    sandbox.ensure_running(ctx.docker, sb)
+    sandbox.ensure_running(ctx.docker, sb, config=ctx.config, paths=ctx.paths)
     if not git.is_seeded(ctx.docker, sb):
         raise KbxError(f"the sandbox clone {sb.workdir} does not exist yet")
     return sb
@@ -447,7 +447,7 @@ def cmd_rm(ctx: Context, args: argparse.Namespace) -> int:
     elif exists:
         try:
             stage.build(ctx.paths, ctx.config, ctx.resolved)
-            sandbox.ensure_running(ctx.docker, sb, timeout=180)
+            sandbox.ensure_running(ctx.docker, sb, timeout=180, config=ctx.config, paths=ctx.paths)
             if git.is_seeded(ctx.docker, sb):
                 pending = git.unfetched(ctx.docker, sb)
                 changes = git.local_changes(ctx.docker, sb)

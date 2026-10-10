@@ -1,4 +1,4 @@
-description = "Image paste for all agents: Xvfb :0 plus a CLIPBOARD owner fed by the host"
+description = "Host image paste and text copy for all agents through Xvfb :0"
 default = true
 
 [service]

@@ -137,7 +137,7 @@ Notes worth knowing:
   only after the first response of a session; the Claude status line omits
   what is missing.
 
-## Clipboard (image paste)
+## Clipboard (image paste and text copy)
 
 One X11 clipboard inside the sandbox serves all three agents: Claude and pi
 run `xclip`, Codex reads X11 directly. The sandbox never connects to the host,
@@ -154,12 +154,22 @@ so the host pushes:
 - Ctrl+V pastes images in all three agents; your terminal or multiplexer must
   pass Ctrl+V through. Text paste is still the terminal's own paste.
 - Host tools: `wl-clipboard` (Wayland) or `xclip` + `clipnotify` (X11).
-  Without them kbx warns once and runs without image paste.
+  Without them kbx warns once and runs without clipboard sync.
 - **Privacy:** while you are attached, every image you copy on the host is
   pushed into that sandbox. Text never is.
-- **Copying out** (`/copy`) works when the agent emits OSC 52, which passes
-  through dtach to your terminal. Copies an agent writes only to the X11
-  clipboard stay in the sandbox; forwarding them is not implemented.
+- **Copying out:** new text copies to the sandbox's X11 clipboard (including
+  Codex's mouse selection and `/copy`) are forwarded to the host clipboard
+  with `wl-copy` or `xclip`. A host-initiated `docker exec` stream listens for
+  selection changes while any session is attached; the sandbox never opens
+  a connection to the host. Copies are UTF-8 text, limited to 1 MiB, and are
+  never logged. Existing clipboard contents are not replayed on reattach.
+  Agents that emit OSC 52 can also copy through dtach to your terminal.
+  Text paste still uses the terminal's own paste.
+- After upgrading the clipboard code, run `kbx build && kbx recreate` in each
+  project to install the updated helpers. `recreate` keeps the home and Docker
+  volumes but stops running sessions. Close all attachments for that sandbox
+  and allow the host clipboard watcher to exit before reattaching, so it
+  loads the updated host code too.
 
 ## Writing a user module
 

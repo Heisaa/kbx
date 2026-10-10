@@ -50,6 +50,7 @@ REPEAT_WINDOW = 60.0  # the same notification again only after this
 MAX_PER_MINUTE = 6  # per sandbox: a chatty (or hostile) agent cannot flood the desktop
 MAX_TITLE = 80
 MAX_BODY = 200
+QUIET_STOP = 30 * 60  # an idle stop sooner than this follows a close: no notification
 STATES = ("working", "waiting", "done")
 LIVE = ("running", "paused", "restarting")
 
@@ -293,7 +294,7 @@ class Watcher:
             actions = guard.Guard(self.paths, self.name).seal()
             if actions:
                 log(f"guard: {guard.summary(actions)}")
-        if self.config.launcher.notify != "off":
+        if self.config.launcher.notify != "off" and self.idle.limit >= QUIET_STOP:
             send(
                 clean(f"kbx stopped {self.project.name}")[:MAX_TITLE],
                 f"Idle for {minutes} min. It starts again at the next kbx command.",

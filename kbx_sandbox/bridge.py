@@ -205,8 +205,8 @@ class Clipboard:
             elif event.type == X.PropertyNotify:
                 self.property(event)
             elif event.type == X.SelectionClear:
-                # Another client (e.g. an agent's own copy) took CLIPBOARD. Text
-                # copies reach the host through the terminal (OSC 52), not here.
+                # Another client (e.g. an agent's own copy) took CLIPBOARD.
+                # kbx-clip-export forwards its text while a host is attached.
                 self.owned = False
         except (OSError, ValueError, error.XError):
             logging.exception("clipboard event failed")

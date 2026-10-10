@@ -4,6 +4,9 @@
 # with host/spike.sh and record the outcome in host/README.md.
 
 [hypervisor.clh]
+# Cloud Hypervisor's normal memfd backing avoids QEMU's /dev/shm mount limit.
+# Host RAM is still shared with the desktop: kbx budgets total VM commitments
+# before starting another sandbox (see docs/host-setup.md).
 # Base VM size. Docker's --memory/--cpus (kbx: [launcher] memory, cpus) are
 # hot-added on top when the runtime supports it (risk R5). If `free -m` and
 # `nproc` inside a sandbox stay near these values, raise them instead.
@@ -13,6 +16,11 @@ default_memory = 2048
 default_maxvcpus = 0
 # virtio-fs shares the container rootfs and the read-only stage mount.
 shared_fs = "virtio-fs"
+# Free page reporting on the balloon device: memory the guest frees goes back
+# to the host instead of staying with the VM until it stops. Without it, a
+# sandbox's host RAM only grows (one big build keeps it near its limit).
+# Guest memory access can be slightly slower.
+reclaim_guest_freed_memory = true
 
 [runtime]
 # Keep the guest's cgroups inside the sandbox cgroup Docker created, so

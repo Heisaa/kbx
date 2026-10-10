@@ -67,6 +67,61 @@ sudo cp /opt/kata/share/defaults/kata-containers/configuration-clh.toml /etc/kat
 Then apply the settings in [`host/kata-configuration.toml`](../host/kata-configuration.toml)
 to `/etc/kata-containers/configuration.toml`.
 
+### VM memory and the desktop
+
+QEMU with virtio-fs normally backs guest RAM with shared files on the host's
+`/dev/shm`. QEMU unlinks these files while keeping them open, so `ls /dev/shm`
+can be empty while `df` reports a full mount. Memory is allocated as the guest
+touches its pages; a collection of lightly used VMs can start successfully and
+fill the mount later. An exhausted mount can cause SIGBUS in the VMs or the
+desktop compositor. This does not imply a leak if stopping the VMs frees it.
+See the [upstream Kata guide](https://github.com/kata-containers/kata-containers/blob/main/docs/how-to/how-to-use-virtio-fs-with-kata.md).
+
+Prefer Cloud Hypervisor where supported. Its normal shared memory uses `memfd`
+and is independent of the `/dev/shm` mount limit, but still consumes host RAM.
+The installer defaults to Cloud Hypervisor for a new configuration; an existing
+configuration is kept, so rerunning `install.sh --hypervisor clh` does not switch
+an existing QEMU setup. To switch the standard Go runtime configuration:
+
+1. Stop all Kata sandboxes and check that `df -h /dev/shm` falls back to low usage.
+2. Back up `/etc/kata-containers/configuration.toml`, replace it with
+   `/opt/kata/share/defaults/kata-containers/configuration-clh.toml`, and reapply
+   the settings from `host/kata-configuration.toml` to the matching keys.
+3. Start one sandbox and verify the running process is `cloud-hypervisor`:
+   `pgrep -af 'cloud-hypervisor|qemu-system'`. Check host RAM and `/dev/shm` while
+   the sandbox runs. The new configuration applies when the next VM starts.
+
+kbx checks memory before each new VM start and serializes concurrent launches.
+Running VMs are charged by the memory they have touched, so several lightly used
+8 GiB sandboxes can run side by side. kbx refuses a start only when the new VM
+could not boot in the host RAM (or, for QEMU and unknown configurations,
+`/dev/shm`) that is free beyond the reserve: the greater of 4 GiB or 20% of RAM,
+and of 512 MiB or 10% of the mount. If the VM could not grow to its full limit,
+kbx warns and starts it anyway; keep an eye on `free -h` and `df -h /dev/shm`
+when running many busy sandboxes. Set `memory_budget` or `shm_budget` to a size
+to refuse instead whenever the total VM limits would exceed it.
+
+To reserve less per sandbox, lower `[launcher] memory` (for example `"4g"`) and
+recreate the existing containers so their stored limits change. Sandboxes stop
+5 minutes after their last session and shell close (`idle_stop`).
+
+With Cloud Hypervisor, `reclaim_guest_freed_memory = true` (in
+`host/kata-configuration.toml`; the installer sets it in a new configuration)
+returns memory the guest frees to the host. Without it a running VM keeps every
+page it has touched until it stops, so one large build leaves it near its limit.
+See [configuration](configuration.md) for `memory_budget`, `shm_budget`, and
+`runtime.memory_overhead`. An unreadable or ambiguous standard Kata config,
+runtime-rs, or a custom runtime name is treated conservatively as shared-memory
+backed; set `memory_overhead` to at least that runtime's actual base VM RAM.
+Stop existing VMs before changing hypervisors or base memory, so their running
+configuration matches what admission reads.
+
+Increasing the size of `/dev/shm` raises its filesystem limit without adding RAM
+or enforcing an aggregate VM budget. Admission covers kbx starts by one user;
+keep direct Docker launches and other host workloads within the same RAM budget.
+If shared-memory usage remains high after stopping the sandboxes, inspect
+`sudo lsof -nP -a +L1 /dev/shm` for surviving holders before launching more.
+
 ## 3. Register the runtime with Docker
 
 `/etc/docker/daemon.json` (merge with what is there):

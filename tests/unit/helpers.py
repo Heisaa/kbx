@@ -50,6 +50,9 @@ class TempHome(unittest.TestCase):
             # No host watcher daemons unless a test asks for one (tests/unit/test_watch.py).
             "KBX_NOTIFY": "off",
             "KBX_IDLE_STOP": "off",
+            # Fake containers do not allocate VM RAM; budget tests mock host capacity explicitly.
+            "KBX_MEMORY_BUDGET": "off",
+            "KBX_SHM_BUDGET": "off",
         }
         patcher = mock.patch.dict(os.environ, self.env, clear=True)
         patcher.start()

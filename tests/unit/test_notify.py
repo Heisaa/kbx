@@ -129,8 +129,9 @@ class FollowTest(Base):
         self.live_session("claude")
         notify.record("claude", "working", "", self.states)  # before follow: not replayed
         script = (
-            "import sys; from pathlib import Path; from kbx_sandbox import notify, session;"
+            "import sys; from functools import partial; from pathlib import Path; from kbx_sandbox import notify, session;"
             f"session.SESSIONS = Path({str(self.sessions)!r}); session.STATES = Path({str(self.states)!r});"
+            "session.status = partial(session.status, session.SESSIONS, session.STATES);"
             f"notify.follow(Path({str(self.states)!r}), tick=0.3, poll=0.05)"
         )
         env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}

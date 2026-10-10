@@ -1,4 +1,4 @@
-"""Host clipboard watcher: push images (or a clear) into the sandbox.
+"""Host clipboard sync: push images in and pull new sandbox text copies out.
 
 The sandbox may not connect to the host, so the host pushes and the sandbox
 never calls out. One clipd runs per sandbox while any agent session is
@@ -8,10 +8,12 @@ process after `execvpe`), and clipd exits once none of them is alive.
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import os
 import queue
+import select
 import shutil
 import subprocess
 import sys
@@ -21,10 +23,13 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from .docker import Docker
+from .errors import KbxError
 from .paths import Paths
 
 MAX_IMAGE = 64 * 1024 * 1024
 PNG = "image/png"
+MAX_TEXT = 1024 * 1024
+MAX_RECORD = 4 * ((MAX_TEXT + 2) // 3)
 
 
 def _starttime(pid: int) -> str | None:
@@ -44,7 +49,7 @@ def _files(paths: Paths, name: str) -> tuple[Path, Path, Path]:
 
 def backend(env: Mapping[str, str]) -> str | None:
     """ "wayland", "x11" or None when the needed tools are missing."""
-    if env.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+    if env.get("WAYLAND_DISPLAY") and shutil.which("wl-paste") and shutil.which("wl-copy"):
         return "wayland"
     if env.get("DISPLAY") and shutil.which("xclip") and shutil.which("clipnotify"):
         return "x11"
@@ -53,7 +58,7 @@ def backend(env: Mapping[str, str]) -> str | None:
 
 def missing_tools_hint(env: Mapping[str, str]) -> str:
     if env.get("WAYLAND_DISPLAY"):
-        return "install wl-clipboard (wl-paste)"
+        return "install wl-clipboard (wl-paste and wl-copy)"
     if env.get("DISPLAY"):
         return "install xclip and clipnotify"
     return "no Wayland or X11 session found"
@@ -138,6 +143,17 @@ class Watcher:
             return None
         return data
 
+    def copy(self, data: bytes) -> bool:
+        """Write sandbox text to the desktop clipboard without logging it."""
+        if self.kind == "wayland":
+            argv = ["wl-copy", "--type", "text/plain;charset=utf-8"]
+        else:
+            argv = ["xclip", "-selection", "clipboard", "-target", "UTF8_STRING", "-in"]
+        result = subprocess.run(
+            argv, input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False
+        )
+        return result.returncode == 0
+
     def watch(self, notify: Callable[[], None], stop: threading.Event) -> None:
         """Call notify() on every clipboard change until stop is set."""
         if self.kind == "wayland":
@@ -182,6 +198,62 @@ def push(docker: Docker, name: str, data: bytes | None) -> bool:
     return result.returncode == 0
 
 
+def copy_record(watcher: Watcher, record: bytes) -> None:
+    if not record or len(record) > MAX_RECORD:
+        return
+    try:
+        data = base64.b64decode(record, validate=True)
+        if len(data) > MAX_TEXT:
+            return
+        data.decode("utf-8")
+        if not watcher.copy(data):
+            print("could not copy sandbox text to the host clipboard", file=sys.stderr)
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        print("could not copy sandbox text to the host clipboard", file=sys.stderr)
+
+
+def watch_copies(docker: Docker, name: str, watcher: Watcher, stop: threading.Event) -> None:
+    """Host-initiated stream; one listener per attached sandbox, no guest networking."""
+    while not stop.is_set():
+        try:
+            process = docker.exec_stream(name, ["kbx-clip-export"], env={"DISPLAY": ":0"})
+        except (OSError, KbxError) as exc:
+            print(f"cannot listen for sandbox copies: {exc}", file=sys.stderr)
+            if stop.wait(5):
+                return
+            continue
+        assert process.stdout is not None and process.stdin is not None
+        try:
+            buffer = bytearray()
+            while not stop.is_set():
+                if not select.select([process.stdout], [], [], 0.2)[0]:
+                    continue
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+                while b"\n" in buffer:
+                    record, _, rest = buffer.partition(b"\n")
+                    buffer = bytearray(rest)
+                    copy_record(watcher, bytes(record))
+                if len(buffer) > MAX_RECORD:
+                    print("sandbox clipboard record exceeds the text limit", file=sys.stderr)
+                    break
+        except OSError as exc:
+            print(f"sandbox copy stream failed: {exc}", file=sys.stderr)
+        finally:
+            # EOF also stops the remote listener, even while it is idle.
+            process.stdin.close()
+            try:
+                process.wait(timeout=7)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+        if stop.wait(5):
+            return
+
+
 def run(paths: Paths, name: str) -> int:
     kind = backend(os.environ)
     lock_path, pids_path, pid_path = _files(paths, name)
@@ -193,6 +265,8 @@ def run(paths: Paths, name: str) -> int:
     stop = threading.Event()
     thread = threading.Thread(target=watcher.watch, args=(lambda: events.put(None), stop), daemon=True)
     thread.start()
+    copies = threading.Thread(target=watch_copies, args=(docker, name, watcher, stop), daemon=True)
+    copies.start()
     last: str | None = None  # sha256 of the last pushed image, "" for clear
     grace = time.monotonic() + 10
     pending = True  # push the current clipboard once at startup
@@ -215,6 +289,7 @@ def run(paths: Paths, name: str) -> int:
                 return 0
     finally:
         stop.set()
+        copies.join(timeout=15)
         try:
             if pid_path.read_text().strip() == str(os.getpid()):
                 pid_path.unlink()

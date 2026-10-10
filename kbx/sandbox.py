@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -13,10 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import config as config_mod
+from . import resources
 from .config import Config
 from .docker import ROOT, Docker
 from .errors import KbxError
-from .paths import Paths
+from .paths import Paths, resolve
 
 HOME = "/home/agent"
 LABEL_PROJECT = "kbx.project"
@@ -285,15 +288,35 @@ def startup_log(docker: Docker, sandbox: Sandbox, lines: int = 60) -> str:
     return result.stdout.decode("utf-8", "replace")
 
 
-def ensure_running(docker: Docker, sandbox: Sandbox, timeout: float = READY_TIMEOUT) -> dict[str, Any]:
+def ensure_running(
+    docker: Docker,
+    sandbox: Sandbox,
+    timeout: float = READY_TIMEOUT,
+    *,
+    config: Config | None = None,
+    paths: Paths | None = None,
+) -> dict[str, Any]:
     status = state(docker, sandbox)
     if status is None:
         raise KbxError(f"sandbox {sandbox.name} does not exist")
     if status == "paused":
         raise KbxError(paused_message(sandbox))
     if status != "running":
-        print(f"→ Starting {sandbox.name}")
-        docker.run(["start", sandbox.name])
+        paths = paths or resolve()
+        config = config or config_mod.load(paths, dict(os.environ))
+        paths.runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (paths.runtime_dir / "start.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            # Another launch may have started or paused this sandbox while we waited.
+            status = state(docker, sandbox)
+            if status == "paused":
+                raise KbxError(paused_message(sandbox))
+            if status is None:
+                raise KbxError(f"sandbox {sandbox.name} does not exist")
+            if status != "running":
+                resources.check(docker, sandbox.name, config)
+                print(f"→ Starting {sandbox.name}")
+                docker.run(["start", sandbox.name])
     return wait_ready(docker, sandbox, timeout)
 
 

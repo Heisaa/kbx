@@ -36,11 +36,13 @@ class LauncherConfig:
     remote_control: bool = True
     skip_onboarding: bool = True
     notify: str = "detached"  # desktop notifications from agent hooks; see NOTIFY
-    idle_stop: int = 2 * 3600  # seconds without sessions or shells before a stop; 0 = never
+    idle_stop: int = 5 * 60  # seconds without sessions or shells before a stop; 0 = never
     codex_search: bool = True
     shared_skills: bool = True
     detach_key: str = "^\\"
     memory: str = "8g"
+    memory_budget: str = "auto"
+    shm_budget: str = "auto"
     cpus: float = 4
     dns: tuple[str, ...] = ("1.1.1.1", "9.9.9.9")
     debug: bool = False
@@ -67,6 +69,7 @@ class ImageConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     name: str = "kata"
+    memory_overhead: str = "2g"  # Kata base VM RAM, in addition to the container limit
     # "caps" (explicit capabilities) or "privileged". Kata 4 cannot start a
     # --privileged container: its agent fails to recreate the host device list
     # (risk R1, see host/README.md).
@@ -238,6 +241,12 @@ def _launcher(table: dict[str, Any], env: Mapping[str, str], where: str) -> Laun
     memory = _str(table, "memory", defaults.memory, where)
     if not _SIZE.match(memory):
         raise KbxError(f"{where}.memory must look like 8g or 4096m")
+    budgets: dict[str, str] = {}
+    for key in ("memory_budget", "shm_budget"):
+        value = _str(table, key, getattr(defaults, key), where).lower()
+        if value not in ("auto", "off") and not _SIZE.fullmatch(value):
+            raise KbxError(f'{where}.{key} must be "auto", "off", or a size like 12g')
+        budgets[key] = value
     disk = _str(table, "docker_disk", defaults.docker_disk, where)
     if not _SIZE.match(disk):
         raise KbxError(f"{where}.docker_disk must look like 64g")
@@ -267,6 +276,8 @@ def _launcher(table: dict[str, Any], env: Mapping[str, str], where: str) -> Laun
         shared_skills=_bool(table, "shared_skills", defaults.shared_skills, where),
         detach_key=detach,
         memory=memory,
+        memory_budget=budgets["memory_budget"],
+        shm_budget=budgets["shm_budget"],
         cpus=float(cpus),
         dns=tuple(dns),
         debug=_bool(table, "debug", defaults.debug, where),
@@ -313,7 +324,10 @@ def _runtime(table: dict[str, Any], env: Mapping[str, str], where: str) -> Runti
     storage = _str(table, "docker_storage", defaults.docker_storage, where)
     if storage not in ("loop", "volume"):
         raise KbxError(f'{where}.docker_storage must be "loop" or "volume"')
-    return RuntimeConfig(name=name, privileges=privileges, docker_storage=storage)
+    overhead = _str(table, "memory_overhead", defaults.memory_overhead, where)
+    if not _SIZE.fullmatch(overhead):
+        raise KbxError(f"{where}.memory_overhead must look like 2g or 2048m")
+    return RuntimeConfig(name=name, privileges=privileges, docker_storage=storage, memory_overhead=overhead)
 
 
 def _workspace(table: dict[str, Any], env: Mapping[str, str], where: str) -> WorkspaceConfig:

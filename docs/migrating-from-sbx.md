@@ -14,7 +14,7 @@ once as a kbx config plus user modules, usually kept in your dotfiles.
 | Kits applied at create time (YAML specs, templating) | Modules: build layer, declarative seeds, services, `start.sh`; seeds and services apply at every start |
 | `sbx run` | `kbx claude\|codex\|pi`, attached through dtach (detach with `Ctrl-\`) |
 | One sandbox per agent and project | One sandbox per project; all three agents share it |
-| Clipboard fetched from the host on demand | Host pushes images while attached; one X11 clipboard serves all agents |
+| Clipboard fetched from the host on demand | Host pushes images in and pulls text copies out while attached; one X11 clipboard serves all agents |
 
 ## Launcher variables
 

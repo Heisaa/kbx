@@ -110,9 +110,9 @@ class StubDocker:
 
 
 class WatcherTest(TempHome):
-    def watcher(self, docker: StubDocker, idle: str = "1h") -> watch.Watcher:
+    def watcher(self, docker: StubDocker, idle: str = "1h", notify: str = "off") -> watch.Watcher:
         p = paths.resolve(os.environ)
-        cfg = config.load(p, {"KBX_IDLE_STOP": idle, "KBX_NOTIFY": "off"})
+        cfg = config.load(p, {"KBX_IDLE_STOP": idle, "KBX_NOTIFY": notify})
         return watch.Watcher(p, "kbx-api-1", docker, cfg)  # type: ignore[arg-type]
 
     def test_idle_stop(self) -> None:
@@ -125,9 +125,23 @@ class WatcherTest(TempHome):
         ):
             clock.return_value = found.idle.since + 60
             self.assertTrue(found.check())
-            clock.return_value = found.idle.since + 3600
+            clock.return_value = found.idle.since + 3601  # not exactly: float rounding
             self.assertFalse(found.check(), "stopped, so the watcher ends")
         self.assertTrue(docker.stopped)
+
+    def test_a_stop_soon_after_a_close_is_quiet(self) -> None:
+        for idle, notified in (("5m", False), ("1h", True)):
+            docker = StubDocker()
+            found = self.watcher(docker, idle, notify="always")
+            found.idle.sessions = {}
+            with (
+                mock.patch.object(watch, "interactive_execs", return_value=0),
+                mock.patch.object(watch, "send") as send,
+                mock.patch.object(watch.time, "monotonic") as clock,
+            ):
+                clock.return_value = found.idle.since + found.idle.limit + 1
+                self.assertFalse(found.check())
+            self.assertEqual(send.called, notified, idle)
 
     def test_not_while_paused_or_after_a_guard_alert(self) -> None:
         docker = StubDocker("paused")

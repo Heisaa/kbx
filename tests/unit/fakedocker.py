@@ -181,6 +181,9 @@ def main() -> int:
     if not args:
         return 0
     command = args[0]
+    if args[:2] == ["context", "inspect"]:
+        print("unix:///var/run/docker.sock")
+        return 0
     if command == "inspect" or (len(args) > 1 and args[1] == "inspect"):
         kind, names = (args[0], args[2:]) if args[1:2] == ["inspect"] else ("container", args[1:])
         table = {"container": "containers", "image": "images", "network": "networks", "volume": "volumes"}[kind]
@@ -210,6 +213,11 @@ def main() -> int:
             "State": {"Status": "created", "StartedAt": "0001-01-01T00:00:00Z"},
             "Config": {"Labels": labels_from(args)},
             "Image": image.get("Id", ""),
+            "HostConfig": {
+                "Runtime": option(args, "--runtime") or "runc",
+                "Memory": int((option(args, "--memory") or "0").rstrip("gGmMkKtT"))
+                * 1024 ** ("kmgt".find((option(args, "--memory") or "0")[-1].lower()) + 1),
+            },
             "Args": args,
         }
         for index, arg in enumerate(args):
@@ -260,9 +268,16 @@ def main() -> int:
         return int(state.get("behave", {}).get("build_status", 0))
     if command == "ps":
         for name, container in state["containers"].items():
+            if "--quiet" in args:
+                if container["State"]["Status"] in ("running", "paused", "restarting"):
+                    print(name)
+                continue
             labels = container["Config"]["Labels"]
             if "kbx.name" in labels:
                 print(f"{name}\t{container['State']['Status']}\t{labels.get('kbx.project', '')}")
+        return 0
+    if command == "info":
+        print("runc")
         return 0
     if command == "logs":
         return 0

@@ -296,12 +296,17 @@ fi
 if ! skipped kata && [ -d /opt/kata ]; then
   if [ -f "$kata_config_dest" ]; then
     ok "$kata_config_dest exists (left as is)"
+    if grep -q '^reclaim_guest_freed_memory *= *false' "$kata_config_dest"; then
+      warn "reclaim_guest_freed_memory = false: VMs keep freed memory until they stop (see host/kata-configuration.toml)"
+    fi
   else
     source_config="/opt/kata/share/defaults/kata-containers/$kata_config_src"
     if [ ! -f "$source_config" ]; then
       warn "$source_config not found; Kata uses its default configuration"
     elif ! $check_only && confirm "use $hypervisor ($source_config) as the Kata configuration"; then
       as_root install -D -m 0644 "$source_config" "$kata_config_dest"
+      # Only where the hypervisor has the key (Cloud Hypervisor does).
+      as_root sed -i 's/^reclaim_guest_freed_memory *=.*/reclaim_guest_freed_memory = true/' "$kata_config_dest"
       ok "configured $hypervisor in $kata_config_dest (see host/kata-configuration.toml)"
     else
       warn "no $kata_config_dest; Kata uses its built-in default"
@@ -406,12 +411,13 @@ fi
 
 # --- 7. clipboard (optional) ---
 
-step "Clipboard tools (image paste; optional)"
+step "Clipboard tools (image paste and text copy; optional)"
 if skipped clipboard; then
   warn "skipped"
 else
   if [ -n "${WAYLAND_DISPLAY:-}" ] || [ "${XDG_SESSION_TYPE:-}" = wayland ]; then
     ensure no wl-paste wl-clipboard
+    ensure no wl-copy wl-clipboard
   fi
   # X11 path: X11 sessions, and Wayland compositors without data-control (GNOME) via XWayland.
   ensure no xclip xclip

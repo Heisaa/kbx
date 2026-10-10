@@ -80,6 +80,9 @@ class ConfigTest(TempHome):
         bad = [
             "[launcher]\nauto_updat = true\n",
             '[launcher]\nmemory = "lots"\n',
+            '[launcher]\nmemory_budget = "lots"\n',
+            '[launcher]\nshm_budget = "0g"\n',
+            '[runtime]\nmemory_overhead = "off"\n',
             "[launcher]\ncpus = 0\n",
             '[launcher]\ndns = ["not-an-ip"]\n',
             '[launcher]\ndetach_key = "ab"\n',
@@ -97,6 +100,19 @@ class ConfigTest(TempHome):
                 self.load(text)
         with self.assertRaises(KbxError):
             self.load(None, {"KBX_AUTO_UPDATE": "maybe"})
+
+    def test_memory_budgets(self) -> None:
+        cfg = self.load()
+        self.assertEqual(cfg.launcher.memory_budget, "auto")
+        self.assertEqual(cfg.launcher.shm_budget, "auto")
+        self.assertEqual(cfg.runtime.memory_overhead, "2g")
+        cfg = self.load(
+            '[launcher]\nmemory_budget = "20g"\nshm_budget = "12g"\n[runtime]\nmemory_overhead = "4g"\n',
+            {"KBX_MEMORY_BUDGET": "16G", "KBX_SHM_BUDGET": "off"},
+        )
+        self.assertEqual(cfg.launcher.memory_budget, "16g")
+        self.assertEqual(cfg.launcher.shm_budget, "off")
+        self.assertEqual(cfg.runtime.memory_overhead, "4g")
 
     def test_workspace(self) -> None:
         cfg = self.load()

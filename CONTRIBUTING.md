@@ -56,4 +56,6 @@ nothing may depend on a particular machine.
   back after `kbx stop` plus relaunch.
 - Image paste: Ctrl+V in Claude, Codex and pi after copying an image on the
   host (Wayland and X11).
+- Text copy: select text in Codex and use `/copy`; paste it into a host app
+  (Wayland and X11), including consecutive copies from the same session.
 - `host/spike.sh` passes on a fresh host.

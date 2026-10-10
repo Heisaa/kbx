@@ -141,6 +141,13 @@ class Docker:
         """Run with the terminal's stdout/stderr, returning the exit status."""
         return self.exec(name, argv, stdout=None, stderr=None, check=False, **kwargs).returncode
 
+    def exec_stream(
+        self, name: str, argv: Sequence[str], *, env: Mapping[str, str] | None = None
+    ) -> subprocess.Popen[bytes]:
+        """Stream an exec's output; closing stdin tells the guest to stop."""
+        args = self.exec_args(name, argv, env=env, interactive=True)
+        return subprocess.Popen([self._resolve(), *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None)
+
     def binary_path(self) -> str:
         return self._resolve()
 
