@@ -44,8 +44,13 @@ starts) stay owned by root on the host.
   empty the directory and then report "Device or resource busy" (it is a
   mount point); that is expected.
 - **Untracked files are shared too.** The agent can read `.env` files and other
-  secrets in the checkout. The internet is open, so it could send them out. Use
-  clone mode for projects where that matters.
+  secrets in the checkout. The internet is open, so it could send them out.
+  When kbx creates a mount-mode sandbox it lists the untracked files whose
+  names look like secrets (`.env*`, `*.pem`, `*.key`, credentials files,
+  `*.tfstate`, `.npmrc`, …) and asks once whether to go ahead (in a terminal;
+  otherwise it only warns). Answer no to move them out first. Keep only
+  secrets there you could afford to lose, such as test or spend-limited keys,
+  or use clone mode for projects where that matters.
 - **Linked worktrees work too.** A worktree is its own project with its own
   sandbox. Its `.git` is a file pointing into the main repository's `.git`, so
   kbx mounts that directory as well, at its own path. The main checkout's files

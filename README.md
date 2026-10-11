@@ -128,7 +128,8 @@ repositories) and pauses the sandbox.
 
 Accepted risks: logins inside the sandbox can be stolen (use a separate account
 or a spend-limited key); the open internet allows exfiltration of the project
-source, **including untracked files like `.env`** in mount mode; **code the
+source, **including untracked files like `.env`** in mount mode (kbx lists
+secret-looking files and asks before it creates the sandbox); **code the
 agent wrote is untrusted** (run it in the sandbox, not on the host); the guard
 reacts within milliseconds but does not block the write itself, and only
 protects while it runs; and while you are attached, images you copy on the host

@@ -11,7 +11,23 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import __version__, agents, clipd, dash, git, guard, host, image, private, review, sandbox, session, stage, watch
+from . import (
+    __version__,
+    agents,
+    clipd,
+    dash,
+    exposed,
+    git,
+    guard,
+    host,
+    image,
+    private,
+    review,
+    sandbox,
+    session,
+    stage,
+    watch,
+)
 from . import config as config_mod
 from . import modules as modules_mod
 from . import paths as paths_mod
@@ -104,6 +120,8 @@ def prepare(ctx: Context, *, seed_clone: bool = True) -> Sandbox:
         exists = sandbox.state(ctx.docker, sb) is not None
         if exists and sandbox.mounted_gitdir(ctx.docker, sb) != (str(shared) if shared else None):
             warn("this worktree's repository directory changed since the sandbox was created; `kbx recreate` mounts it")
+        if not exists:
+            _confirm_exposed(sb, "Create the sandbox anyway?")
     sandbox.ensure_created(ctx.docker, sb, ctx.config, ctx.paths)
     starting = sandbox.state(ctx.docker, sb) not in ("running", "paused")
     if guarded(ctx, sb) and starting:
@@ -125,6 +143,22 @@ def prepare(ctx: Context, *, seed_clone: bool = True) -> Sandbox:
     if starting:
         review.record_start(ctx.docker, ctx.paths, sb)
     return sb
+
+
+def _confirm_exposed(sb: Sandbox, question: str) -> None:
+    """Mount mode, before the checkout is first shared: list the secret-looking
+    files the agent will see and, in a terminal, ask before going on."""
+    message = exposed.warning(sb.project_dir)
+    if not message:
+        return
+    warn(message)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    if not _ask(question, True):
+        raise KbxError(
+            "nothing changed; move the secrets out of the checkout "
+            'or set [workspace] mode = "clone", then run kbx again'
+        )
 
 
 def existing_running(ctx: Context) -> Sandbox:
@@ -410,6 +444,8 @@ def cmd_recreate(ctx: Context, args: argparse.Namespace) -> int:
     new = replace(sb, mode=ctx.config.workspace.mode)
     if new.mode == "mount":
         sandbox.check_mountable(new)
+        if sb.mode != "mount":
+            _confirm_exposed(new, "Recreate it in mount mode anyway?")
     _stop(ctx, sb)
     sandbox.remove_container(ctx.docker, sb)
     sandbox.ensure_created(ctx.docker, new, ctx.config, ctx.paths)

@@ -465,6 +465,52 @@ class MountModeTest(CliTest):
         self.assertEqual(result.returncode, 1)
         self.assertIn("not needed in mount mode", result.stderr)
 
+    def test_secret_files_asked_once_at_create(self) -> None:
+        (self.repo / ".env").write_text("KEY=x\n")
+        status, output = self.tty("start", answer="n\n")
+        self.assertEqual(status, 1, output)
+        self.assertIn("the agent will be able to read these files", output)
+        self.assertIn("    .env\n", output)
+        self.assertIn("Create the sandbox anyway? [Y/n]", output)
+        self.assertIn("nothing changed", output)
+        self.assertEqual(self.docker_state()["containers"], {})
+        status, output = self.tty("start", answer="\n")
+        self.assertEqual(status, 0, output)
+        self.assertLess(output.index("[Y/n]"), output.index("Creating sandbox"))
+        status, output = self.tty("start")
+        self.assertEqual(status, 0, output)
+        self.assertNotIn("the agent will be able to read", output)
+
+    def test_secret_files_warned_without_a_terminal(self) -> None:
+        (self.repo / ".env").write_text("KEY=x\n")
+        result = subprocess.run(
+            [sys.executable, str(KBX), "start"],
+            cwd=str(self.repo),
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the agent will be able to read these files", result.stderr)
+        self.assertNotIn("[Y/n]", result.stdout + result.stderr)
+
+    def test_secret_files_not_warned_in_clone_mode_until_switching(self) -> None:
+        self.clone_mode()
+        (self.repo / ".env").write_text("KEY=x\n")
+        _, output = self.tty("start")
+        self.assertNotIn("the agent will be able to read", output)
+        (self.home / ".config/kbx/config.toml").write_text("")
+        status, output = self.tty("recreate", answer="n\n")
+        self.assertEqual(status, 1, output)
+        self.assertIn("Recreate it in mount mode anyway?", output)
+        self.assertIn("kbx.workspace=clone", self.create_args())
+        status, output = self.tty("recreate", answer="y\n")
+        self.assertEqual(status, 0, output)
+        self.assertIn("kbx.workspace=mount", self.create_args())
+
     def private_calls(self) -> list[list[str]]:
         path = self.state_dir / "private.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []

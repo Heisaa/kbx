@@ -109,7 +109,9 @@ sandbox user, including root inside the VM (it has Docker).
   in your checkout as it makes them, so review `git diff` before running
   anything on the host; run and test inside the sandbox.
 - **Mount mode shares the whole checkout**, untracked files included: the
-  agent can read `.env` files in it (and send them out), and a crafted file can
+  agent can read `.env` files in it (and send them out; kbx lists
+  secret-looking untracked files and asks once, before it creates the sandbox,
+  but does not hide them: the agent is root in its VM), and a crafted file can
   target a host tool the guard does not know. The guard is a watcher, not a
   wall: between the agent's write and its repair there are milliseconds, and it
   only protects while it runs (kbx starts it with the sandbox and checks for
