@@ -45,6 +45,7 @@ class ModulesTest(TempHome):
                 "node-toolchain",
                 "notify",
                 "playwright",
+                "voice",
             },
         )
         resolved = modules.resolve(found, self.cfg())

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Supervised by kbx-init: the sandbox's PulseAudio server (see voice.pa).
+# A restart starts from clean FIFOs and socket.
+set -eu
+rm -f /run/kbx-voice/pulse /run/kbx-voice/mic /run/kbx-voice/speaker
+exec pulseaudio -n -F "$KBX_MODULE_DIR/voice.pa" --daemonize=no --exit-idle-time=-1 --disallow-exit \
+  --use-pid-file=no --realtime=no --high-priority=no --log-target=stderr --log-level=error

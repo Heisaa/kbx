@@ -26,6 +26,7 @@ from . import (
     sandbox,
     session,
     stage,
+    voice,
     watch,
 )
 from . import config as config_mod
@@ -192,8 +193,28 @@ def _clipboard(ctx: Context, sb: Sandbox) -> None:
         warn(f"clipboard sync is off: cannot start the clipboard watcher ({exc})")
 
 
+def _voice(ctx: Context, sb: Sandbox) -> None:
+    if not agents.enabled(ctx.resolved, "voice"):
+        return
+    if voice.tools() is None:
+        marker = ctx.paths.runtime_dir / "voice-warned"
+        if not marker.exists():
+            warn(f"voice input is off: {voice.MISSING_TOOLS} on the host")
+            try:
+                ctx.paths.runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                marker.touch()
+            except OSError:
+                pass
+        return
+    try:
+        voice.register(ctx.paths, sb.name, os.getpid(), ENTRY)
+    except OSError as exc:
+        warn(f"voice input is off: cannot start the voice link ({exc})")
+
+
 def _attach(ctx: Context, sb: Sandbox, agent: str, inner: Sequence[str]) -> None:
     _clipboard(ctx, sb)
+    _voice(ctx, sb)
     if guarded(ctx, sb):
         guard.register_tty(ctx.paths, sb.name)
     host_env = dict(os.environ)
@@ -256,6 +277,7 @@ def cmd_attach(ctx: Context, args: argparse.Namespace) -> int:
 def cmd_shell(ctx: Context, args: argparse.Namespace) -> int:
     sb = prepare(ctx)
     _clipboard(ctx, sb)
+    _voice(ctx, sb)
     if guarded(ctx, sb):
         guard.register_tty(ctx.paths, sb.name)
     session.exec_attach(
@@ -410,6 +432,7 @@ def cmd_logs(ctx: Context, args: argparse.Namespace) -> int:
         "  ~/.claude/debug/*.txt      (KBX_DEBUG=true kbx claude → claude --debug)\n"
         "  ~/.codex/log/              and `codex app-server daemon status`\n"
         f"Clipboard watcher (host): {ctx.paths.log_dir}/clipd-{sb.name}.log\n"
+        f"Voice link (host, voice module): {ctx.paths.log_dir}/voiced-{sb.name}.log\n"
         f"Guard (host, mount mode): {ctx.paths.log_dir}/guard-{sb.name}.log\n"
         "Host: journalctl -t kata (containerd shim), and firewall drop counters:\n"
         "  sudo iptables -vnL KBX-INPUT; sudo iptables -vnL KBX-FORWARD"
@@ -700,6 +723,8 @@ def dispatch(argv: Sequence[str], env: Mapping[str, str]) -> int:
         return cmd_agent(Context.load(env), argv[0], argv[1:])
     if argv and argv[0] == "_clipd" and len(argv) == 2:
         return clipd.run(paths_mod.resolve(env), argv[1])
+    if argv and argv[0] == "_voiced" and len(argv) == 2:
+        return voice.run(paths_mod.resolve(env), argv[1])
     if argv and argv[0] == "_guard" and len(argv) == 2:
         return guard.run(paths_mod.resolve(env), argv[1])
     if argv and argv[0] == "_watch" and len(argv) == 2:

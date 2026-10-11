@@ -132,8 +132,9 @@ source, **including untracked files like `.env`** in mount mode (kbx lists
 secret-looking files and asks before it creates the sandbox); **code the
 agent wrote is untrusted** (run it in the sandbox, not on the host); the guard
 reacts within milliseconds but does not block the write itself, and only
-protects while it runs; and while you are attached, images you copy on the host
-are pushed into that sandbox for pasting. Clone mode (`[workspace] mode =
+protects while it runs; while you are attached, images you copy on the host
+are pushed into that sandbox for pasting; and with the opt-in `voice` module,
+the agent can record from your microphone while you are attached. Clone mode (`[workspace] mode =
 "clone"`) keeps the checkout out entirely and git crosses only as bundles. Full
 details: [PLAN.md](PLAN.md#threat-model).
 

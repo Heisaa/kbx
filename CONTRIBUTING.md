@@ -58,4 +58,8 @@ nothing may depend on a particular machine.
   host (Wayland and X11).
 - Text copy: select text in Codex and use `/copy`; paste it into a host app
   (Wayland and X11), including consecutive copies from the same session.
+- Voice (with the `voice` module): Claude's `/voice` transcribes held-Space
+  speech; Codex's `/voice` hears you and answers out loud, including after
+  mute/unmute. The host microphone indicator is on only while recording, and
+  goes off on detach.
 - `host/spike.sh` passes on a fresh host.

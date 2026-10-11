@@ -6,7 +6,7 @@
 #
 #   --check        only report; change nothing (exit 1 if something required is missing)
 #   --yes          do not ask before installing or restarting anything
-#   --skip         any of: packages, docker, kata, runtime, firewall, clipboard, link
+#   --skip         any of: packages, docker, kata, runtime, firewall, clipboard, voice, link
 #   --kata-runtime go (default: the Go runtime with `kata-runtime check`) or rs
 #                  (runtime-rs, the Rust runtime Kata 4 ships in kata-static)
 #   --build        run `kbx build` at the end
@@ -95,6 +95,8 @@ package_for() { # dependency
     *:wl-clipboard) echo wl-clipboard ;;
     *:xclip) echo xclip ;;
     *:clipnotify) echo - ;;
+    pacman:pacat) echo libpulse ;;
+    *:pacat) echo pulseaudio-utils ;;
     *) echo - ;;
   esac
 }
@@ -426,7 +428,17 @@ else
   ensure no clipnotify clipnotify "$clip_hint"
 fi
 
-# --- 8. kbx on PATH ---
+# --- 8. voice (optional) ---
+
+step "Voice tools (microphone and speakers for the voice module; optional)"
+if skipped voice; then
+  warn "skipped"
+else
+  # pacat talks to PulseAudio and PipeWire (pipewire-pulse) alike.
+  ensure no pacat pacat "or install alsa-utils (arecord and aplay)"
+fi
+
+# --- 9. kbx on PATH ---
 
 step "kbx command"
 target="$HOME/.local/bin/kbx"

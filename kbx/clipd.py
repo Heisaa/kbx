@@ -2,14 +2,12 @@
 
 The sandbox may not connect to the host, so the host pushes and the sandbox
 never calls out. One clipd runs per sandbox while any agent session is
-attached. Each attach registers its own PID (it becomes the `docker exec`
-process after `execvpe`), and clipd exits once none of them is alive.
+attached (see attached.py).
 """
 
 from __future__ import annotations
 
 import base64
-import fcntl
 import hashlib
 import os
 import queue
@@ -22,6 +20,7 @@ import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
+from . import attached
 from .docker import Docker
 from .errors import KbxError
 from .paths import Paths
@@ -30,21 +29,7 @@ MAX_IMAGE = 64 * 1024 * 1024
 PNG = "image/png"
 MAX_TEXT = 1024 * 1024
 MAX_RECORD = 4 * ((MAX_TEXT + 2) // 3)
-
-
-def _starttime(pid: int) -> str | None:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return None
-    # The command name may contain spaces or parentheses; fields follow the last ")".
-    fields = stat[stat.rfind(")") + 2 :].split()
-    return fields[19] if len(fields) > 19 else None
-
-
-def _files(paths: Paths, name: str) -> tuple[Path, Path, Path]:
-    base = paths.runtime_dir
-    return base / f"clipd-{name}.lock", base / f"clipd-{name}.pids", base / f"clipd-{name}.pid"
+DAEMON = "clipd"
 
 
 def backend(env: Mapping[str, str]) -> str | None:
@@ -62,58 +47,6 @@ def missing_tools_hint(env: Mapping[str, str]) -> str:
     if env.get("DISPLAY"):
         return "install xclip and clipnotify"
     return "no Wayland or X11 session found"
-
-
-def _alive(pid: int) -> bool:
-    try:
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return False
-    return b"_clipd" in cmdline
-
-
-def register(paths: Paths, name: str, pid: int, entry: Path) -> None:
-    """Register an attach PID and make sure a clipd runs for this sandbox."""
-    paths.runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock_path, pids_path, pid_path = _files(paths, name)
-    with open(lock_path, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        start = _starttime(pid)
-        with open(pids_path, "a") as handle:
-            handle.write(f"{pid} {start}\n")
-        try:
-            current = int(pid_path.read_text().strip())
-        except (OSError, ValueError):
-            current = 0
-        if current and _alive(current):
-            return
-        paths.log_dir.mkdir(parents=True, exist_ok=True)
-        with open(paths.log_dir / f"clipd-{name}.log", "ab") as log:
-            process = subprocess.Popen(
-                [sys.executable, str(entry), "_clipd", name],
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=log,
-                start_new_session=True,
-                close_fds=True,
-            )
-        pid_path.write_text(f"{process.pid}\n")
-
-
-def _live_attaches(pids_path: Path, lock_path: Path) -> int:
-    with open(lock_path, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            lines = pids_path.read_text().splitlines()
-        except OSError:
-            return 0
-        alive: list[str] = []
-        for line in lines:
-            pid_text, _, start = line.partition(" ")
-            if pid_text.isdigit() and _starttime(int(pid_text)) == start:
-                alive.append(line)
-        pids_path.write_text("".join(f"{line}\n" for line in alive))
-        return len(alive)
 
 
 class Watcher:
@@ -254,9 +187,12 @@ def watch_copies(docker: Docker, name: str, watcher: Watcher, stop: threading.Ev
             return
 
 
+def register(paths: Paths, name: str, pid: int, entry: Path) -> None:
+    attached.register(paths, DAEMON, name, pid, entry)
+
+
 def run(paths: Paths, name: str) -> int:
     kind = backend(os.environ)
-    lock_path, pids_path, pid_path = _files(paths, name)
     if kind is None:
         return 0
     docker = Docker()
@@ -285,13 +221,9 @@ def run(paths: Paths, name: str) -> int:
                     events.get_nowait()
             except queue.Empty:
                 pass
-            if time.monotonic() > grace and _live_attaches(pids_path, lock_path) == 0:
+            if time.monotonic() > grace and attached.live(paths, DAEMON, name) == 0:
                 return 0
     finally:
         stop.set()
         copies.join(timeout=15)
-        try:
-            if pid_path.read_text().strip() == str(os.getpid()):
-                pid_path.unlink()
-        except OSError:
-            pass
+        attached.release(paths, DAEMON, name)

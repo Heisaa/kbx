@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from kbx import clipd, paths
+from kbx import attached, clipd, paths
 from kbx_sandbox import init, session
 
 
@@ -110,12 +110,12 @@ class ClipdRegistrationTest(unittest.TestCase):
         entry = home / "fake-entry"
         entry.write_text("import time; time.sleep(0.1)\n")
         clipd.register(p, "kbx-x-1", os.getpid(), entry)
-        lock, pids, pidfile = clipd._files(p, "kbx-x-1")
+        _, pids, pidfile = attached.files(p, "clipd", "kbx-x-1")
         self.assertIn(str(os.getpid()), pids.read_text())
         self.assertTrue(pidfile.exists())
-        self.assertEqual(clipd._live_attaches(pids, lock), 1)
+        self.assertEqual(attached.live(p, "clipd", "kbx-x-1"), 1)
         pids.write_text("999999 123\n")
-        self.assertEqual(clipd._live_attaches(pids, lock), 0)
+        self.assertEqual(attached.live(p, "clipd", "kbx-x-1"), 0)
 
     def test_backend_detection(self) -> None:
         self.assertIsNone(clipd.backend({}))

@@ -128,6 +128,12 @@ sandbox user, including root inside the VM (it has Docker).
   merging. `git push --no-verify` skips the push hooks.
 - The clipboard channel pushes every image you copy while attached into the
   sandbox (see [Clipboard](#clipboard-image-paste-for-all-agents)).
+- With the opt-in `voice` module, the agent can record from the host
+  microphone whenever a session is attached, and play sound on the host. The
+  host records only while a program in the sandbox records, notifies at the
+  start of a recording after a quiet period, and logs every start and stop;
+  but the agent controls its own audio server, so it can start one at will
+  (see [docs/modules.md](docs/modules.md#voice-input-claude-and-codex)).
 
 ---
 
@@ -361,7 +367,9 @@ self-location. Internal modules:
 | `guard.py` | mount mode: host-side guard of `.git` and protected files (see [Workspace](#workspace-mount-mode-and-the-guard)) |
 | `agents.py` | per-agent prelaunch and argv (remote control, Codex auth/search, update commands) |
 | `session.py` | dtach command lines and the final `execvpe` attach |
+| `attached.py` | per-sandbox host daemons that live while any session is attached (reference-counted attach PIDs) |
 | `clipd.py` | host clipboard watcher (spawned in the background, reference-counted per sandbox) |
+| `voice.py` | host voice link: host microphone and speakers for the `voice` module, on demand while attached |
 | `docker.py` | the only place that runs `docker` |
 
 ### Commands
@@ -797,6 +805,7 @@ Generic features only. Anything opinionated is off by default.
 | `claude-statusline` | off | `home/.claude/statusline.mjs` (sandbox name, model, dir, branch, context, plan quota) and `home/.claude/settings.json` (`statusLine`) |
 | `codex-statusline` | off | `home/.codex/config.toml` with `tui.status_line = ["context-used", "five-hour-limit", "weekly-limit"]` |
 | `codex-reset-fast` | off | `start.sh`: remove a persisted `service_tier = "fast"` from Codex config on every start, so Fast mode never silently carries over between sessions. The launcher also runs it before each Codex launch |
+| `voice` | off | `build.sh`: PulseAudio, alsa-utils, a fixed ALSA pulse plugin. `start.sh` + `service`: PulseAudio with FIFO-backed microphone and speaker; `link.py` reports their use over a host-initiated `docker exec`. The host side (`voice.py`) is launcher core and gated on this module |
 
 ### User modules and templates
 

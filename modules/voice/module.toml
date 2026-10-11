@@ -1,0 +1,8 @@
+description = "Voice input for Claude and Codex: the host microphone and speakers while attached (adds about 200 MB)"
+default = false
+
+[start]
+user = "root"
+
+[service]
+user = "agent"

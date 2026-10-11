@@ -12,6 +12,7 @@
 # claude-statusline = false
 # codex-statusline = false
 # codex-reset-fast = false
+# voice = false               # Claude/Codex /voice with the host mic and speakers (~200 MB)
 # my-claude-defaults = true   # a user module in ~/.config/kbx/modules/
 
 # [options.node-toolchain]

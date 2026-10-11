@@ -1,0 +1,9 @@
+# kbx voice: a microphone fed and a speaker drained through FIFOs that
+# link.py connects to the host while a session is attached. No hardware and
+# no network modules.
+.fail
+load-module module-native-protocol-unix socket=/run/kbx-voice/pulse auth-anonymous=1
+load-module module-pipe-source source_name=kbx_mic file=/run/kbx-voice/mic format=s16le rate=48000 channels=1
+load-module module-pipe-sink sink_name=kbx_speaker file=/run/kbx-voice/speaker format=s16le rate=48000 channels=1 use_system_clock_for_timing=yes
+set-default-source kbx_mic
+set-default-sink kbx_speaker

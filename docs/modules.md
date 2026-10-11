@@ -121,6 +121,7 @@ more than 5 exits in a minute. `dockerd` is supervised the same way. Status:
 | `claude-statusline` | off | `~/.claude/statusline.mjs` and the `statusLine` setting |
 | `codex-statusline` | off | `tui.status_line = ["context-used", "five-hour-limit", "weekly-limit"]` |
 | `codex-reset-fast` | off | `start.sh`: remove a persisted `service_tier = "fast"` at every start and before each Codex launch |
+| `voice` | off | `build.sh`: PulseAudio, alsa-utils and a fixed ALSA pulse plugin (about 200 MB). `start.sh` + `service`: a PulseAudio server whose microphone and speaker the host connects while attached. Host side is `kbx`'s voice link |
 
 Notes worth knowing:
 
@@ -170,6 +171,41 @@ so the host pushes:
   volumes but stops running sessions. Close all attachments for that sandbox
   and allow the host clipboard watcher to exit before reattaching, so it
   loads the updated host code too.
+
+## Voice input (Claude and Codex)
+
+The `voice` module is off by default. Turn it on with `voice = true` under
+`[modules]`, then `kbx build && kbx recreate`. Claude's `/voice` (hold Space to
+talk) and Codex's `/voice` (a spoken conversation; Codex answers out loud) then
+use the microphone and speakers of the host you are attached from.
+
+The VM has no sound hardware, and the sandbox never connects to the host:
+
+- In the sandbox, a PulseAudio server is the default ALSA device. Its
+  microphone is fed, and its speaker drained, through FIFOs in
+  `/run/kbx-voice`. Claude records with `arecord`; Codex's voice helper opens
+  ALSA directly.
+- While any session is attached, `kbx` keeps one `docker exec` stream open to
+  the module's `link.py`, which reports when a program starts or stops
+  recording or playing. The host runs `pacat` (PulseAudio or PipeWire through
+  `pipewire-pulse`), or `arecord`/`aplay`, **only while** a program in the
+  sandbox records or plays. Your desktop's microphone indicator shows it.
+  Audio is raw 48 kHz mono PCM.
+- Host tools: `pacat` (`pulseaudio-utils`; `libpulse` on Arch) or
+  `alsa-utils`. Without them kbx warns once and runs without voice.
+- **Privacy:** while you are attached, the agent can record from your
+  microphone whenever it likes, not only when you ask it to listen (it is root
+  in its VM and controls its own audio server). kbx sends a desktop
+  notification when recording starts after 10 minutes without any, and logs
+  every start and stop in `voiced-<sandbox>.log` (`kbx logs` prints the path).
+  Nothing is recorded while you are detached. Leave the module off if that is
+  not acceptable.
+- Use headphones with Codex: its echo cancellation cannot account for the
+  extra playback delay through the host, so it may hear its own voice.
+- Debian's ALSA pulse plugin reports a transient error while a new stream
+  waits for its first timing update (a sign bug in `pulse_delay()`), which
+  Codex treats as a lost speaker. The module builds the plugin from the
+  pinned upstream source with that one comparison fixed.
 
 ## Writing a user module
 

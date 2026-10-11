@@ -15,7 +15,7 @@ run `kbx check` after editing.
 | config | `$XDG_CONFIG_HOME/kbx/config.toml` (`~/.config/kbx/`) |
 | user modules | `$XDG_CONFIG_HOME/kbx/modules/<name>/` |
 | stage (mounted read-only into sandboxes) | `$XDG_DATA_HOME/kbx/stage/` (`~/.local/share/kbx/`) |
-| logs (clipboard watcher, guard) | `$XDG_DATA_HOME/kbx/log/` |
+| logs (clipboard watcher, voice link, guard) | `$XDG_DATA_HOME/kbx/log/` |
 | guard baselines, trusted copies, quarantine | `$XDG_DATA_HOME/kbx/guard/<sandbox>/` |
 | runtime (clipd and guard pidfiles) | `$XDG_RUNTIME_DIR/kbx/` |
 | built-in modules | `<checkout>/modules/`, found relative to the resolved `bin/kbx` |
