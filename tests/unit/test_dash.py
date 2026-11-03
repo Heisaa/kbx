@@ -19,7 +19,7 @@ from typing import Any
 from unittest import mock
 
 from kbx import config, dash, git, guard, paths, sandbox, status
-from kbx.docker import Docker
+from kbx.docker import Docker, DockerTimeout
 from kbx.status import Details, Row, Snapshot
 from tests.unit.helpers import KBX, TempHome
 from tests.unit.helpers import git as run_git
@@ -678,6 +678,22 @@ class ProfileDashTest(DashBase):
         lines = status.profile_git(self.docker, self.sb, "2020-01-01T00:00:00Z", [web.session_key("claude")])
         self.assertEqual(lines[0], f"{self.web} (claude)")
         self.assertTrue(any("commit(s) on HEAD" in line for line in lines[1:]), lines)
+
+    def test_details_of_a_hung_vm(self) -> None:
+        """After a host hibernates the VM may stop answering: one timeout is reported, not a crash."""
+        row = next(iter(status.list_rows(self.docker, self.paths, self.cfg)))
+        calls: list[list[str]] = []
+
+        def hung(args: Any, **kwargs: Any) -> Any:
+            calls.append(list(args))
+            raise DockerTimeout(f"docker {args[0]} timed out after 15s")
+
+        with mock.patch.object(self.docker, "run", side_effect=hung):
+            details = status.collect_details(self.docker, row)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(len(details.errors), 1, details.errors)
+        self.assertIn(f"{self.sb.name} did not answer", details.errors[0])
+        self.assertIn("kbx stop", details.errors[0])
 
     def test_attach_picks_a_project_session(self) -> None:
         app = KeysTest.app(self, "2")  # type: ignore[arg-type]

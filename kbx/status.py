@@ -26,7 +26,7 @@ from typing import TypeVar
 from . import agents, git, guard, image
 from . import sandbox as sandbox_mod
 from .config import Config
-from .docker import Docker
+from .docker import Docker, DockerTimeout
 from .errors import KbxError
 from .modules import Resolved
 from .paths import Paths
@@ -350,17 +350,25 @@ def collect_details(docker: Docker, row: Row) -> Details:
     if not row.running:
         return details
     sb = row.sandbox
+    hung = False
 
     def attempt(label: str, step: Callable[[], T]) -> T | None:
+        # A hung VM would make every later step wait out its own timeout too.
+        nonlocal hung
+        if hung:
+            return None
         try:
             return step()
+        except DockerTimeout as exc:
+            hung = True
+            details.errors.append(f"{label}: {exc}")
         except (KbxError, OSError, ValueError) as exc:
             details.errors.append(f"{label}: {exc}")
-            return None
+        return None
 
     details.health = attempt("health", lambda: health(docker, sb))
     if sb.profile:
-        live = sandbox_mod.sessions(docker, sb.name)
+        live = attempt("sessions", lambda: sandbox_mod.sessions(docker, sb.name)) or []
         details.git = attempt("git", lambda: profile_git(docker, sb, row.started_at, live)) or []
     elif sb.mode == "mount":
         details.git = attempt("git", lambda: mount_git(docker, sb, row.started_at)) or []

@@ -16,6 +16,10 @@ AGENT = "agent"
 ROOT = "root"
 
 
+class DockerTimeout(KbxError):
+    """A docker command that did not finish in time; for exec, often a hung VM."""
+
+
 class Docker:
     def __init__(self, binary: str | None = None, verbose: bool = False) -> None:
         self.binary = binary or os.environ.get("KBX_DOCKER", "docker")
@@ -55,7 +59,7 @@ class Docker:
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:
-            raise KbxError(f"docker {args[0]} timed out after {timeout:.0f}s") from None
+            raise DockerTimeout(f"docker {args[0]} timed out after {timeout:.0f}s") from None
         if check and result.returncode != 0:
             raise KbxError(f"docker {' '.join(args[:2])} failed: {_last_line(result.stderr)}")
         return result
@@ -124,15 +128,21 @@ class Docker:
     ) -> subprocess.CompletedProcess[bytes]:
         interactive = input is not None or stdin is not None
         args = self.exec_args(name, argv, user=user, workdir=workdir, env=env, interactive=interactive)
-        return self.run(
-            args,
-            input=input,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            check=check,
-            timeout=timeout,
-        )
+        try:
+            return self.run(
+                args,
+                input=input,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                check=check,
+                timeout=timeout,
+            )
+        except DockerTimeout:
+            raise DockerTimeout(
+                f"{name} did not answer (docker exec timed out after {timeout:.0f}s). Its VM may be hung, "
+                "as can happen after the host suspends or hibernates: `kbx stop` it and try again"
+            ) from None
 
     def exec_text(self, name: str, argv: Sequence[str], **kwargs: Any) -> str:
         return self.exec(name, argv, **kwargs).stdout.decode("utf-8", "replace").strip()
