@@ -21,6 +21,7 @@ review before running anything on the host remain the protection.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -104,13 +105,17 @@ class Colorizer:
 # --- start points ---
 
 
-def _start_file(paths: Paths, name: str) -> Path:
-    return paths.data_dir / "starts" / name
+def _start_file(paths: Paths, sandbox: Sandbox) -> Path:
+    """Where the start point lives: per sandbox, and per project in a profile."""
+    if sandbox.profile:
+        return paths.data_dir / "starts" / sandbox.name / sandbox.slug
+    return paths.data_dir / "starts" / sandbox.name
 
 
 def record_start(docker: Docker, paths: Paths, sandbox: Sandbox) -> None:
-    """Remember the commit HEAD is at as the sandbox starts, for `--since-start`."""
-    target = _start_file(paths, sandbox.name)
+    """Remember the commit HEAD is at as the sandbox starts, for `--since-start`.
+    A profile's project records at its first launch after the sandbox started."""
+    target = _start_file(paths, sandbox)
     result = docker.exec(
         sandbox.name, ["git", "-C", sandbox.workdir, "rev-parse", "-q", "--verify", "HEAD"], check=False, timeout=60
     )
@@ -122,20 +127,27 @@ def record_start(docker: Docker, paths: Paths, sandbox: Sandbox) -> None:
         target.unlink(missing_ok=True)
 
 
-def start_point(paths: Paths, name: str) -> str:
+def has_start(paths: Paths, sandbox: Sandbox) -> bool:
+    return _start_file(paths, sandbox).is_file()
+
+
+def start_point(paths: Paths, sandbox: Sandbox) -> str:
     try:
-        sha = _start_file(paths, name).read_text().strip()
+        sha = _start_file(paths, sandbox).read_text().strip()
     except OSError:
         sha = ""
     if not git.SHA.match(sha):
-        raise KbxError(
-            "no start point recorded for this sandbox (it starts recording at its next start); use --since REV"
-        )
+        when = "its next start" if not sandbox.profile else "the next kbx command in this project after a start"
+        raise KbxError(f"no start point recorded for this project (it records at {when}); use --since REV")
     return sha
 
 
-def forget_start(paths: Paths, name: str) -> None:
-    _start_file(paths, name).unlink(missing_ok=True)
+def forget_start(paths: Paths, sandbox: Sandbox) -> None:
+    """Drop the start point: this sandbox's, or every project's of a profile."""
+    if sandbox.profile:
+        shutil.rmtree(paths.data_dir / "starts" / sandbox.name, ignore_errors=True)
+    else:
+        _start_file(paths, sandbox).unlink(missing_ok=True)
 
 
 # --- output ---

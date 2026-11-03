@@ -148,6 +148,33 @@ class FollowTest(Base):
         self.assertEqual((event["agent"], event["state"], event["attached"]), ("claude", "done", False))
 
 
+class ProfileSessionTest(Base):
+    """A profile sandbox names sessions agent@project; each keeps its own state."""
+
+    def test_hooks_record_per_session(self) -> None:
+        key = "claude@api-1a2b3c"
+        self.hook({"hook_event_name": "Stop", "last_assistant_message": "Done."}, env={"KBX_SESSION": key})
+        self.assertEqual(self.state(key)["session"], key)
+        self.assertEqual(self.state(key)["agent"], "claude")
+        self.assertFalse((self.states / "claude.json").exists())
+        self.hook({"hook_event_name": "SessionEnd"}, env={"KBX_SESSION": key})
+        self.assertFalse((self.states / f"{key}.json").exists())
+        for wrong in ("codex@api-1a2b3c", "claude@../x", "claude@"):
+            self.hook({"hook_event_name": "Stop"}, env={"KBX_SESSION": wrong})
+        self.assertEqual(sorted(p.name for p in self.states.iterdir()), ["events.jsonl"])
+
+    def test_status_lists_profile_sessions(self) -> None:
+        key = "codex@web-abcdef"
+        self.live_session(key)
+        (self.sessions / "evil name.sock").touch()
+        notify.record("codex", "waiting", "approve?", self.states, key)
+        found = session.status(self.sessions, self.states)
+        self.assertEqual(list(found), [key])
+        self.assertEqual(found[key]["state"], "waiting")
+        self.assertTrue(session.valid(key))
+        self.assertFalse(session.valid("claude@../../x"))
+
+
 class LoginTest(unittest.TestCase):
     def test_pi(self) -> None:
         home = Path(tempfile.mkdtemp(prefix="kbx-login-"))

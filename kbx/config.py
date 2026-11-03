@@ -7,10 +7,11 @@ errors, so a typo never silently falls back to a default.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -149,6 +150,26 @@ class HostConfig:
     channel: str = "stable"  # kbx's own Claude Code: "stable" or "latest"
 
 
+# What a profile may set besides its roots; the rest of the config is shared.
+PROFILE_LAUNCHER = ("memory", "cpus", "idle_stop")
+PROFILE_WORKSPACE = ("private", "protect")
+_PROFILE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+@dataclass(frozen=True)
+class ProfileConfig:
+    """`[profiles.<name>]`: one sandbox for every project under `roots`.
+
+    `launcher` and `workspace` are the full settings in effect for the profile:
+    the global ones with the profile's overrides, and `KBX_*` overrides on top.
+    """
+
+    name: str
+    roots: tuple[Path, ...]
+    launcher: LauncherConfig = field(default_factory=LauncherConfig)
+    workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
+
+
 @dataclass(frozen=True)
 class Config:
     launcher: LauncherConfig = field(default_factory=LauncherConfig)
@@ -160,6 +181,12 @@ class Config:
     host: HostConfig = field(default_factory=HostConfig)
     modules: Mapping[str, bool] = field(default_factory=dict[str, bool])
     options: Mapping[str, Mapping[str, OptionValue]] = field(default_factory=dict[str, Mapping[str, OptionValue]])
+    profiles: Mapping[str, ProfileConfig] = field(default_factory=dict[str, ProfileConfig])
+
+    def for_profile(self, name: str) -> Config:
+        """The settings in effect in a profile's sandbox."""
+        profile = self.profiles[name]
+        return replace(self, launcher=profile.launcher, workspace=profile.workspace)
 
 
 _TRUE = {"1", "true", "yes", "on"}
@@ -439,6 +466,97 @@ def _options(table: dict[str, Any], where: str) -> dict[str, dict[str, OptionVal
     return result
 
 
+def _inside(parent: Path, path: Path) -> bool:
+    return path == parent or parent in path.parents
+
+
+def _profiles(
+    data: Mapping[str, Any],
+    globals_: tuple[dict[str, Any], dict[str, Any]],
+    paths: Paths,
+    env: Mapping[str, str],
+    where: str,
+) -> dict[str, ProfileConfig]:
+    """`globals_`: the raw [launcher] and [workspace] tables the profiles start from."""
+    launcher_table, workspace_table = globals_
+    table = _table(data, "profiles", where)
+    result: dict[str, ProfileConfig] = {}
+    owners: list[tuple[Path, str]] = []
+    # Never mount what keeps kbx's own state: the guard's baselines, the config.
+    own = [paths.config_dir, paths.data_dir, paths.runtime_dir]
+    for name, raw in table.items():
+        at = f"[profiles.{name}]"
+        if not _PROFILE.match(name):
+            raise KbxError(
+                f"{at}: a profile name is 1-32 characters of a-z, 0-9 and -, starting with a letter or digit"
+            )
+        if not isinstance(raw, dict):
+            raise KbxError(f"{at} must be a table")
+        values: dict[str, Any] = dict(raw)  # pyright: ignore[reportUnknownArgumentType]
+        _reject_unknown(values, {"roots", *PROFILE_LAUNCHER, *PROFILE_WORKSPACE}, at)
+        items = _strings(values, "roots", (), at)
+        if not items:
+            raise KbxError(f'{at}.roots must list at least one directory, e.g. roots = ["~/work"]')
+        roots: list[Path] = []
+        for item in items:
+            root = expand_user(item, paths.home)
+            if not root.is_absolute():
+                raise KbxError(f"{at}.roots: {item} must be absolute or start with ~/")
+            root = Path(os.path.normpath(root))
+            if root.exists():
+                root = root.resolve()
+            if _inside(root, paths.home) or root == Path("/"):
+                raise KbxError(f"{at}.roots: {item} would mount your whole home directory; list project directories")
+            for path in own:
+                if _inside(root, path):
+                    raise KbxError(f"{at}.roots: {item} contains kbx's own files ({path})")
+            for other, owner in owners:
+                if _inside(other, root) or _inside(root, other):
+                    same = "twice" if owner == name else f"in profiles {owner} and {name}"
+                    raise KbxError(
+                        f"{at}.roots: {root} and {other} overlap ({same}); a directory belongs to one profile"
+                    )
+            owners.append((root, name))
+            roots.append(root)
+        launcher = dict(launcher_table)
+        launcher.update({key: values[key] for key in PROFILE_LAUNCHER if key in values})
+        workspace = dict(workspace_table)
+        workspace.update({key: values[key] for key in PROFILE_WORKSPACE if key in values})
+        workspace["mode"] = "mount"  # a profile shares its roots; clone mode is per project
+        result[name] = ProfileConfig(
+            name=name,
+            roots=tuple(roots),
+            launcher=_launcher(launcher, env, f"{at} (or [launcher])"),
+            workspace=_workspace(
+                workspace, {k: v for k, v in env.items() if k != "KBX_WORKSPACE"}, f"{at} (or [workspace])"
+            ),
+        )
+    return result
+
+
+def profile_for(config: Config, path: Path, env: Mapping[str, str]) -> ProfileConfig | None:
+    """The profile whose roots contain `path`, or the one `KBX_PROFILE` names
+    (`KBX_PROFILE=none`: no profile). None means a sandbox for the project alone."""
+    chosen = env.get("KBX_PROFILE", "").strip()
+    if chosen.lower() == "none":
+        return None
+    if chosen:
+        if chosen not in config.profiles:
+            known = ", ".join(sorted(config.profiles)) or "none configured"
+            raise KbxError(f"KBX_PROFILE={chosen}: no such profile ({known})")
+        return config.profiles[chosen]
+    try:
+        absolute = path.resolve()
+    except OSError:
+        absolute = path
+    best: tuple[int, ProfileConfig] | None = None
+    for profile in config.profiles.values():
+        for root in profile.roots:
+            if _inside(root, absolute) and (best is None or len(root.parts) > best[0]):
+                best = (len(root.parts), profile)
+    return best[1] if best else None
+
+
 def load(paths: Paths, env: Mapping[str, str]) -> Config:
     """Read the user's config file (if any) and validate it."""
     path = paths.config_file
@@ -454,16 +572,22 @@ def load(paths: Paths, env: Mapping[str, str]) -> Config:
 
 
 def parse(data: Mapping[str, Any], paths: Paths, env: Mapping[str, str], where: str) -> Config:
-    sections = {"launcher", "network", "image", "runtime", "workspace", "skills", "host", "modules", "options"}
+    sections = {
+        "launcher", "network", "image", "runtime", "workspace", "skills", "host", "modules", "options", "profiles",
+    }  # fmt: skip
     _reject_unknown(data, sections, where)
+    launcher_table = _table(data, "launcher", where)
+    workspace_table = _table(data, "workspace", where)
+    profiles = _profiles(data, (dict(launcher_table), dict(workspace_table)), paths, env, where)
     return Config(
-        launcher=_launcher(_table(data, "launcher", where), env, "[launcher]"),
+        launcher=_launcher(launcher_table, env, "[launcher]"),
         network=_network(_table(data, "network", where), "[network]"),
         image=_image(_table(data, "image", where), env, "[image]"),
         runtime=_runtime(_table(data, "runtime", where), env, "[runtime]"),
-        workspace=_workspace(_table(data, "workspace", where), env, "[workspace]"),
+        workspace=_workspace(workspace_table, env, "[workspace]"),
         skills=_skills(_table(data, "skills", where), paths.home, "[skills]"),
         host=_host(_table(data, "host", where), paths.home, "[host]"),
         modules=_modules(_table(data, "modules", where), "[modules]"),
         options=_options(_table(data, "options", where), "[options]"),
+        profiles=profiles,
     )

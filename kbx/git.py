@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,6 +72,26 @@ def project_root(cwd: Path) -> Path:
     if host_git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}", check=False).returncode != 0:
         raise KbxError(f"{root} has no commits yet. Create one first:\n  git commit --allow-empty -m init")
     return root
+
+
+def profile_project(cwd: Path, roots: Sequence[Path]) -> Path:
+    """The project a profile command works in: the closest directory from cwd up
+    to its root that has a `.git` (no commit needed), else cwd itself. Outside
+    every root (KBX_PROFILE names the profile): the first root.
+
+    No git runs: the directories are the agent's to write, and only the file
+    system is read to find the repository."""
+    absolute = cwd.resolve()
+    root = next((r for r in roots if absolute == r or r in absolute.parents), None)
+    if root is None:
+        return roots[0]
+    current = absolute
+    while True:
+        if os.path.lexists(current / ".git"):
+            return current
+        if current == root:
+            return absolute
+        current = current.parent
 
 
 def _strip_credentials(url: str) -> str:
@@ -146,8 +167,37 @@ def write_mount_note(docker: Docker, sandbox: Sandbox) -> None:
     docker.exec(
         sandbox.name,
         ["sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1"', "sh", NOTE],
-        input=_mount_note(sandbox).encode(),
+        input=(_profile_note(sandbox) if sandbox.profile else _mount_note(sandbox)).encode(),
     )
+
+
+def _profile_note(sandbox: Sandbox) -> str:
+    roots = "\n".join(f"- `{root}`" for root in sandbox.roots)
+    return f"""# kbx sandbox (profile {sandbox.profile})
+
+These directories are the developer's own, mounted from the host. Every project
+in them is shared: your changes and commits appear on the host immediately, and
+theirs appear here.
+
+{roots}
+
+- Work in the project you were started in. Other projects here belong to the
+  same developer, but change them only when asked.
+- Commit freely. You cannot push: the developer pushes from the host.
+- Do not change `.git/config`, git hooks, or hook and editor files such as
+  `.husky/`, `.pre-commit-config.yaml`, `lefthook.yml`, `.vscode/settings.json`,
+  in any project. The host runs those; the kbx guard reverts such changes and
+  pauses this sandbox, with every session in it, until the developer reviews
+  them. Ask the developer instead.
+- Files you create as root stay owned by root on the host; work as `agent`.
+- Build directories such as `target/` and `.venv/` are this sandbox's own,
+  mounted over the host's (which you do not see), so both sides keep their
+  builds. `cargo clean` or `rm -rf target` empty them and then report
+  "Device or resource busy": expected, the directory is empty.
+- When several agents work in one project at once, give each its own worktree
+  outside the shared directories: `git worktree add ~/work/<project>-<task> -b
+  <branch>`. Its branch shows up on the host right away.
+"""
 
 
 def _mount_note(sandbox: Sandbox) -> str:

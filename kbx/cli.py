@@ -44,7 +44,7 @@ ENTRY = paths_mod.CHECKOUT / "bin" / "kbx"
 USAGE = """\
 kbx [dash]                          dashboard over all sandboxes (on a terminal)
 kbx claude|codex|pi [agent args…]   create/start the sandbox, update, attach
-kbx attach [claude|codex|pi]        reattach to a running session
+kbx attach [claude|codex|pi|SESSION]   reattach to a running session
 kbx shell                           bash in the sandbox (as agent)
 kbx start                           create/start the sandbox (and seed the clone), no attach
 kbx resume [--accept]               after the guard paused the sandbox: review, resume
@@ -61,6 +61,9 @@ kbx check                           validate modules and config
 kbx seed [--dry-run|--status|--reset M]   manage home defaults
 kbx ls                              list sandboxes and their sessions
 kbx host [-c|-r [ID]] [--model M] [prompt]   Claude on the host, locked down (asks first)
+
+Under a root of a [profiles.<name>] in config.toml, commands use that profile's
+sandbox (sessions per project); KBX_PROFILE=<name>|none overrides.
 """
 
 
@@ -92,20 +95,72 @@ def warn(message: str) -> None:
 
 
 def current_sandbox(ctx: Context, cwd: Path | None = None) -> Sandbox:
-    """This project's sandbox, in the mode its container was created with."""
-    sb = sandbox.for_project(git.project_root(cwd or Path.cwd()), ctx.config.workspace.mode)
+    """The sandbox this directory works in: its profile's when a profile's roots
+    contain it (or KBX_PROFILE names one), else the project's own, in the mode
+    its container was created with. A profile's settings replace ctx.config."""
+    here = cwd or Path.cwd()
+    profile = config_mod.profile_for(ctx.config, here, ctx.env)
+    if profile is not None:
+        if ctx.env.get("KBX_WORKSPACE", "").strip() == "clone":
+            raise KbxError(f"profile {profile.name} shares its roots (mount mode); KBX_WORKSPACE=clone does not apply")
+        ctx.config = ctx.config.for_profile(profile.name)
+        return sandbox.for_profile(profile.name, profile.roots, git.profile_project(here, profile.roots))
+    sb = sandbox.for_project(git.project_root(here), ctx.config.workspace.mode)
     existing = sandbox.workspace_mode(ctx.docker, sb)
     return sb if existing in (None, sb.mode) else replace(sb, mode=existing)
+
+
+def _check_profile(ctx: Context, sb: Sandbox, exists: bool) -> None:
+    """Profile: the roots exist, the container mounts what the config lists, and
+    the project is reachable inside it."""
+    missing = [root for root in sb.roots if not root.is_dir()]
+    if missing:
+        raise KbxError(
+            f"{missing[0]} does not exist; create it or remove it from [profiles.{sb.profile}] roots in config.toml"
+        )
+    if exists:
+        mounted = sandbox.mounted_roots(sandbox.labels(ctx.docker, sb.name))
+        if set(mounted) != set(sb.roots):
+            if sandbox.root_of(replace(sb, profile_roots=mounted), sb.project_dir) is None:
+                raise KbxError(
+                    f"{sb.project_dir} is in profile {sb.profile}'s roots, but {sb.name} was created before; "
+                    "`kbx recreate` mounts the roots from the config"
+                )
+            warn(f"profile {sb.profile}'s roots changed since {sb.name} was created; `kbx recreate` mounts them")
+    unreachable = sandbox.unreachable_gitdir(sb)
+    if unreachable is not None:
+        warn(
+            f"this worktree's repository {unreachable} is outside profile {sb.profile}'s roots, "
+            "so git does not work in it inside the sandbox; add its directory to the roots"
+        )
+    if (sb.project_dir / ".git").exists():
+        alone = sandbox.for_project(sb.project_dir, "mount")
+        if ctx.docker.inspect("container", alone.name) is not None:
+            warn(
+                f"{alone.name}, a sandbox for this project alone, still exists; this project now uses "
+                f"profile {sb.profile}. `KBX_PROFILE=none kbx rm` here removes the old one"
+            )
 
 
 def guarded(ctx: Context, sb: Sandbox) -> bool:
     return sb.mode == "mount" and ctx.config.workspace.guard
 
 
+def mounted(ctx: Context, sb: Sandbox) -> Sandbox:
+    """The sandbox with the roots its container mounts, which the guard must
+    watch (the config may list others until `kbx recreate`)."""
+    if not sb.profile:
+        return sb
+    roots = sandbox.mounted_roots(sandbox.labels(ctx.docker, sb.name))
+    return replace(sb, profile_roots=roots) if roots else sb
+
+
 def prepare(ctx: Context, *, seed_clone: bool = True) -> Sandbox:
     """Launch sequence steps 1-4: config, stage, create, start, firewall, then
     the guard (mount mode) or the clone (clone mode)."""
     sb = current_sandbox(ctx)
+    if sb.profile:
+        _check_profile(ctx, sb, sandbox.state(ctx.docker, sb) is not None)
     if sb.mode != ctx.config.workspace.mode:
         warn(
             f"{sb.name} was created in {sb.mode} mode, but the config says {ctx.config.workspace.mode}; "
@@ -126,10 +181,10 @@ def prepare(ctx: Context, *, seed_clone: bool = True) -> Sandbox:
     sandbox.ensure_created(ctx.docker, sb, ctx.config, ctx.paths)
     starting = sandbox.state(ctx.docker, sb) not in ("running", "paused")
     if guarded(ctx, sb) and starting:
-        guard.before_start(ctx.paths, sb, ctx.config.workspace.protect)
+        guard.before_start(ctx.paths, mounted(ctx, sb), ctx.config.workspace.protect)
     sandbox.ensure_running(ctx.docker, sb, config=ctx.config, paths=ctx.paths)
     if guarded(ctx, sb):  # before anything below can fail and leave it unwatched
-        guard.ensure(ctx.paths, sb, ctx.docker, ENTRY, ctx.config.workspace.protect)
+        guard.ensure(ctx.paths, mounted(ctx, sb), ctx.docker, ENTRY, ctx.config.workspace.protect)
     elif sb.mode == "mount":
         warn("the kbx guard is off ([workspace] guard = false): the agent can plant git hooks the host runs")
     sandbox.firewall_check(ctx.docker, sb, ctx.config, dict(ctx.env))
@@ -142,20 +197,31 @@ def prepare(ctx: Context, *, seed_clone: bool = True) -> Sandbox:
     elif seed_clone and not git.is_seeded(ctx.docker, sb):
         git.seed(ctx.docker, sb)
     if starting:
+        review.forget_start(ctx.paths, sb)  # a profile's other projects too: they record at their next launch
+    if starting or (sb.profile and not review.has_start(ctx.paths, sb)):
         review.record_start(ctx.docker, ctx.paths, sb)
     return sb
 
 
-def _confirm_exposed(sb: Sandbox, question: str) -> None:
-    """Mount mode, before the checkout is first shared: list the secret-looking
-    files the agent will see and, in a terminal, ask before going on."""
-    message = exposed.warning(sb.project_dir)
+def _confirm_exposed(sb: Sandbox, question: str, roots: Sequence[Path] = ()) -> None:
+    """Mount mode, before the checkout (or a profile's roots) is first shared: list
+    the secret-looking files the agent will see and, in a terminal, ask before
+    going on. `roots`: a profile's roots to check (default: all of them)."""
+    if sb.profile:
+        message = exposed.roots_warning(roots or sb.roots)
+    else:
+        message = exposed.warning(sb.project_dir)
     if not message:
         return
     warn(message)
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return
     if not _ask(question, True):
+        if sb.profile:
+            raise KbxError(
+                f"nothing changed; move the secrets out of the roots of profile {sb.profile}, or keep "
+                "those projects out of the profile, then run kbx again"
+            )
         raise KbxError(
             "nothing changed; move the secrets out of the checkout "
             'or set [workspace] mode = "clone", then run kbx again'
@@ -212,65 +278,99 @@ def _voice(ctx: Context, sb: Sandbox) -> None:
         warn(f"voice input is off: cannot start the voice link ({exc})")
 
 
-def _attach(ctx: Context, sb: Sandbox, agent: str, inner: Sequence[str]) -> None:
+def _attach(ctx: Context, sb: Sandbox, key: str, inner: Sequence[str]) -> None:
+    """Hand the terminal to session `key` (`claude`, or `claude@<project>` in a profile)."""
+    agent = sandbox.session_agent(key)
     _clipboard(ctx, sb)
     _voice(ctx, sb)
     if guarded(ctx, sb):
         guard.register_tty(ctx.paths, sb.name)
     host_env = dict(os.environ)
     host_env["HERDR_AGENT"] = agent  # Herdr sees `docker`, not the agent
-    key = ctx.config.launcher.detach_key
-    if key.lower() not in ("", "none"):
-        print(f"  Detach with {key.replace('^', 'Ctrl-')}; reattach with `kbx attach {agent}`.")
+    detach = ctx.config.launcher.detach_key
+    if detach.lower() not in ("", "none"):
+        print(f"  Detach with {detach.replace('^', 'Ctrl-')}; reattach with `kbx attach {agent}`.")
     session.exec_attach(
         ctx.docker,
         sb,
         inner,
         workdir=sb.workdir,
         # Marks the session kbx started; kbx-notify reports only these.
-        env=session.session_env({**ctx.module_env(), "KBX_SESSION": agent}),
+        env=session.session_env({**ctx.module_env(), "KBX_SESSION": key}),
         host_env=host_env,
     )
+
+
+def _where(sb: Sandbox) -> str:
+    return f"{sb.name}, in {sb.project_dir}" if sb.profile else sb.name
 
 
 def cmd_agent(ctx: Context, name: str, args: Sequence[str]) -> int:
     agent = agents.get(name)
     sb = prepare(ctx)
-    key = ctx.config.launcher.detach_key
-    if session.alive(ctx.docker, sb, agent.name):
+    detach = ctx.config.launcher.detach_key
+    key = sb.session_key(agent.name)
+    if session.alive(ctx.docker, sb, key):
         # Never update or touch remote control under a live session.
-        print(f"→ Reattaching to the running {agent.name} session in {sb.name}")
+        print(f"→ Reattaching to the running {agent.name} session in {_where(sb)}")
         if args:
             warn("agent arguments are ignored when reattaching to a running session")
-        _attach(ctx, sb, agent.name, session.dtach_attach(agent.name, key))
+        _attach(ctx, sb, key, session.dtach_attach(key, detach))
         return 0
     if ctx.config.launcher.auto_update:
-        agents.update(ctx.docker, sb, agent, strict=False)
+        others = _agent_sessions(ctx, sb, agent.name)
+        if others:
+            # The binary is shared by every project of a profile; it updates when none runs.
+            print(f"→ Not updating {agent.name}: it runs in {', '.join(map(sandbox.session_label, others))}")
+        else:
+            agents.update(ctx.docker, sb, agent, strict=False)
     agents.prelaunch(ctx.docker, sb, agent, ctx.config, ctx.resolved)
     argv = agents.command(agent, args, ctx.config, ctx.resolved)
-    print(f"→ Starting {agent.name} in {sb.name}")
-    _attach(ctx, sb, agent.name, session.dtach_start(agent.name, key, argv))
+    print(f"→ Starting {agent.name} in {_where(sb)}")
+    _attach(ctx, sb, key, session.dtach_start(key, detach, argv))
     return 0
+
+
+def _agent_sessions(ctx: Context, sb: Sandbox, agent: str) -> list[str]:
+    """Live sessions of `agent` in this sandbox (any project of a profile)."""
+    return [key for key in sandbox.sessions(ctx.docker, sb.name) if sandbox.session_agent(key) == agent]
+
+
+def attach_target(sb: Sandbox, live: Sequence[str], name: str | None) -> str:
+    """The session `kbx attach [name]` means. `name`: an agent (this project's
+    session of it), a full session name from `kbx ls`, or None (this project's
+    only session)."""
+    if name is not None and "@" in name:
+        if not sb.profile or not sandbox.valid_session(name):
+            raise KbxError(f"{name!r} is not a session of this sandbox")
+        if name not in live:
+            raise KbxError(f"no running session {name}; `kbx ls` lists them")
+        return name
+    others = [key for key in live if not sb.owns_session(key)]
+    elsewhere = f"; in other projects of profile {sb.profile}: {', '.join(others)}" if others else ""
+    if name is None:
+        mine = [key for key in live if sb.owns_session(key)]
+        if len(mine) == 1:
+            return mine[0]
+        if mine:
+            names = ", ".join(sandbox.session_agent(key) for key in mine)
+            raise KbxError(f"several sessions are running ({names}); name one")
+        raise KbxError(f"no running sessions{' in this project' if sb.profile else ''}{elsewhere}")
+    agent = agents.get(name)
+    key = sb.session_key(agent.name)
+    if key not in live:
+        raise KbxError(f"no running {agent.name} session; start one with `kbx {agent.name}`{elsewhere}")
+    return key
 
 
 def cmd_attach(ctx: Context, args: argparse.Namespace) -> int:
     sb = existing_running(ctx)
-    live = sandbox.sessions(ctx.docker, sb.name)
-    name: str | None = args.agent
-    if name is None:
-        if len(live) != 1:
-            raise KbxError(
-                "no running sessions" if not live else f"several sessions are running ({', '.join(live)}); name one"
-            )
-        name = live[0]
-    agents.get(name)
-    if name not in live:
-        raise KbxError(f"no running {name} session; start one with `kbx {name}`")
+    key = attach_target(sb, sandbox.sessions(ctx.docker, sb.name), args.agent)
     sandbox.firewall_check(ctx.docker, sb, ctx.config, dict(ctx.env))
     if guarded(ctx, sb):
-        guard.ensure(ctx.paths, sb, ctx.docker, ENTRY, ctx.config.workspace.protect)
+        guard.ensure(ctx.paths, mounted(ctx, sb), ctx.docker, ENTRY, ctx.config.workspace.protect)
     watch.ensure(ctx.paths, sb, ctx.config, ENTRY)
-    _attach(ctx, sb, name, session.dtach_attach(name, ctx.config.launcher.detach_key))
+    _attach(ctx, sb, key, session.dtach_attach(key, ctx.config.launcher.detach_key))
     return 0
 
 
@@ -294,6 +394,8 @@ def cmd_shell(ctx: Context, args: argparse.Namespace) -> int:
 def cmd_start(ctx: Context, args: argparse.Namespace) -> int:
     sb = prepare(ctx)
     where = f"working in {sb.workdir}" if sb.mode == "mount" else f"clone at {sb.workdir}"
+    if sb.profile:
+        where = f"profile {sb.profile} ({', '.join(map(str, sb.roots))}); {where}"
     print(f"✓ {sb.name} is running; {where}")
     return 0
 
@@ -309,14 +411,14 @@ def cmd_resume(ctx: Context, args: argparse.Namespace) -> int:
         print(line)
     if lines:
         accept = args.accept or _ask("Were these changes yours? Restore them", False)
-        for note in guard.resolve(ctx.paths, sb, ctx.config.workspace.protect, accept=accept):
+        for note in guard.resolve(ctx.paths, mounted(ctx, sb), ctx.config.workspace.protect, accept=accept):
             print(f"  {note}")
         if not accept:
             print("Kept the neutralized versions; the agent's stay at the quarantine paths above.")
     if status == "paused":
         ctx.docker.run(["unpause", sb.name])
     if status in ("running", "paused") and guarded(ctx, sb):
-        guard.ensure(ctx.paths, sb, ctx.docker, ENTRY, ctx.config.workspace.protect)
+        guard.ensure(ctx.paths, mounted(ctx, sb), ctx.docker, ENTRY, ctx.config.workspace.protect)
     print(f"✓ {sb.name} " + ("resumed" if status == "paused" else "can start again"))
     return 0
 
@@ -340,7 +442,7 @@ def cmd_diff(ctx: Context, args: argparse.Namespace) -> int:
         raise KbxError(f"the sandbox clone {sb.workdir} does not exist yet")
     if args.since_start and args.since:
         raise KbxError("use --since-start or --since, not both")
-    base = review.start_point(ctx.paths, sb.name) if args.since_start else (args.since or "")
+    base = review.start_point(ctx.paths, sb) if args.since_start else (args.since or "")
     if base and not review.revision_ok(base):
         raise KbxError(f"not a revision: {base!r}")
     if sb.mode == "clone":
@@ -364,6 +466,8 @@ def cmd_sync(ctx: Context, args: argparse.Namespace) -> int:
 def existing_or_start(ctx: Context) -> Sandbox:
     """Start an existing sandbox if needed (git commands never create one)."""
     sb = current_sandbox(ctx)
+    if sb.profile:
+        raise KbxError(f"not needed in profile {sb.profile}: its projects are shared, so commits show up on both sides")
     status = sandbox.state(ctx.docker, sb)
     if status is None:
         raise KbxError("no sandbox for this project yet; start one with `kbx claude|codex|pi`")
@@ -384,8 +488,8 @@ def existing_or_start(ctx: Context) -> Sandbox:
 def cmd_update(ctx: Context, args: argparse.Namespace) -> int:
     sb = prepare(ctx, seed_clone=False)
     for agent in agents.AGENTS.values():
-        if session.alive(ctx.docker, sb, agent.name):
-            print(f"→ Skipping {agent.name}: its session is running (it updates at its next fresh start)")
+        if _agent_sessions(ctx, sb, agent.name):
+            print(f"→ Skipping {agent.name}: a session of it is running (it updates at its next fresh start)")
             continue
         agents.update(ctx.docker, sb, agent, strict=True)
     return 0
@@ -443,7 +547,7 @@ def cmd_logs(ctx: Context, args: argparse.Namespace) -> int:
 def _stop(ctx: Context, sb: Sandbox) -> None:
     sandbox.stop(ctx.docker, sb)
     if guarded(ctx, sb):
-        actions = guard.Guard(ctx.paths, sb.name).seal()
+        actions = guard.seal(ctx.paths, sb.name)
         if actions:
             warn(f"the kbx guard neutralized {guard.summary(actions)}; `kbx resume` shows the details")
 
@@ -469,6 +573,11 @@ def cmd_recreate(ctx: Context, args: argparse.Namespace) -> int:
         sandbox.check_mountable(new)
         if sb.mode != "mount":
             _confirm_exposed(new, "Recreate it in mount mode anyway?")
+    if sb.profile:
+        _check_profile(ctx, sb, False)
+        added = [root for root in sb.roots if root not in sandbox.mounted_roots(sandbox.labels(ctx.docker, sb.name))]
+        if added:
+            _confirm_exposed(sb, "Recreate it with these roots anyway?", added)
     _stop(ctx, sb)
     sandbox.remove_container(ctx.docker, sb)
     sandbox.ensure_created(ctx.docker, new, ctx.config, ctx.paths)
@@ -496,10 +605,14 @@ def cmd_rm(ctx: Context, args: argparse.Namespace) -> int:
     exists = status is not None
     volumes = [v for v in (sb.home_volume, sb.docker_volume) if ctx.docker.inspect("volume", v)]
     if not exists and not volumes:
-        print(f"Nothing to remove for {sb.project_dir}.")
+        print(f"Nothing to remove for {f'profile {sb.profile}' if sb.profile else sb.project_dir}.")
         return 0
     inspected = False
-    if exists and sb.mode == "mount" and (status != "running" or not git.is_seeded(ctx.docker, sb)):
+    if sb.profile:
+        print(f"Profile {sb.profile}'s directories are not touched: {', '.join(map(str, sb.roots))}")
+        print("  Agent logins and history in the sandbox's home volume are deleted with it.")
+        inspected = True
+    elif exists and sb.mode == "mount" and (status != "running" or not git.is_seeded(ctx.docker, sb)):
         # The work is in the checkout; only an old clone from clone mode could hold more.
         print(f"Your checkout {sb.project_dir} is not touched.")
         inspected = True
@@ -534,7 +647,7 @@ def cmd_rm(ctx: Context, args: argparse.Namespace) -> int:
     sandbox.remove_container(ctx.docker, sb)
     sandbox.remove_volumes(ctx.docker, sb)
     guard.remove(ctx.paths, sb.name)
-    review.forget_start(ctx.paths, sb.name)
+    review.forget_start(ctx.paths, sb)
     print(f"✓ Removed {sb.name}")
     return 0
 
@@ -577,6 +690,11 @@ def cmd_check(env: Mapping[str, str]) -> int:
         prefix = "✗" if issue.level == "error" else "⚠"
         errors += issue.level == "error"
         print(f"{prefix} {issue.message}")
+    for profile in cfg.profiles.values():
+        print(f"  profile {profile.name}: {', '.join(map(str, profile.roots))}")
+        for root in profile.roots:
+            if not root.is_dir():
+                print(f"⚠ profile {profile.name}: {root} does not exist")
     if not any(source.is_dir() for source in cfg.skills.sources) and cfg.launcher.shared_skills:
         print(f"  skills: no source directory found ({', '.join(map(str, cfg.skills.sources))})")
     print("✓ no problems found" if not errors else f"✗ {errors} error(s)")
@@ -615,7 +733,11 @@ def cmd_host(ctx: Context, args: argparse.Namespace) -> int:
     host.preflight(ctx.env, ctx.paths)
     for line in host.summary(project, ctx.config, ctx.paths):
         print(line)
-    sb = sandbox.for_project(project, ctx.config.workspace.mode)
+    profile = config_mod.profile_for(ctx.config, project, ctx.env)
+    if profile is not None:
+        sb = sandbox.for_profile(profile.name, profile.roots, project)
+    else:
+        sb = sandbox.for_project(project, ctx.config.workspace.mode)
     if sandbox.state(ctx.docker, sb) == "running":
         print(f"  note: {sb.name} is running for this project too; both can edit the checkout.")
     if not _ask("Start Claude on the host?", False):
@@ -634,7 +756,11 @@ def cmd_ls(ctx: Context, args: argparse.Namespace) -> int:
         return 0
     for row in rows:
         live = sandbox.sessions(ctx.docker, row["name"]) if row["state"] == "running" else []
-        print(f"{row['name']:<48} {row['state']:<10} {','.join(live) or '-':<18} {row['project']}")
+        where = row["project"]
+        if row["profile"]:
+            roots = sandbox.mounted_roots(sandbox.labels(ctx.docker, row["name"]))
+            where = f"profile {row['profile']}: {', '.join(map(str, roots))}"
+        print(f"{row['name']:<48} {row['state']:<10} {','.join(live) or '-':<18} {where}")
     return 0
 
 
@@ -648,7 +774,7 @@ def parser() -> argparse.ArgumentParser:
     top.add_argument("--version", action="version", version=f"kbx {__version__}")
     sub = top.add_subparsers(dest="command", metavar="COMMAND")
     attach = sub.add_parser("attach", help="reattach to a running session")
-    attach.add_argument("agent", nargs="?", choices=list(agents.AGENTS))
+    attach.add_argument("agent", nargs="?", help="claude, codex or pi; or a session name from `kbx ls`")
     sub.add_parser("shell", help="bash in the sandbox")
     sub.add_parser("start", help="create/start the sandbox without attaching")
     resume = sub.add_parser("resume", help="review what the guard stopped and resume the sandbox")

@@ -72,7 +72,7 @@ a decision before it is added.
 | Runtime | Kata Containers (needed for Docker-in-sandbox with a separate kernel) |
 | Network | Full internet; no host, LAN, link-local or metadata access |
 | Workspace | Mount mode (default): the checkout at its own path, guarded from the host. Clone mode: a private clone, bundles in and out |
-| Granularity | One sandbox per project; claude, codex and pi installed in the same sandbox and sharing the clone |
+| Granularity | One sandbox per project by default; a profile (`[profiles.<name>]`) puts every project under its roots into one sandbox, with sessions per project (see [Profiles](#profiles-one-sandbox-for-many-projects)). claude, codex and pi installed in the same sandbox and sharing the checkout or clone |
 | Sessions | Detach/reattach without tmux keybindings (see [Sessions](#sessions-detach-without-tmux)) |
 | Features | Image paste (**all three agents**), optional Playwright + Chromium, `HERDR_AGENT` hint for Herdr users |
 | Pi | Install + skills; optional pi defaults through a user module (template in `examples/`) |
@@ -126,6 +126,12 @@ sandbox user, including root inside the VM (it has Docker).
   for a re-`allow`), `.lfsconfig` pointing git-lfs at another server, and
   editor workspace trust. Review changes to these files in the diff before
   merging. `git push --no-verify` skips the push hooks.
+- **A profile shares its projects with each other.** Every agent in a
+  profile's sandbox can read and change every project under its roots,
+  untracked secrets included, and its logins serve all of them; a prompt
+  injection from one repository reaches the others. Profiles are isolated from
+  each other and from project sandboxes like any two sandboxes (see
+  [Profiles](#profiles-one-sandbox-for-many-projects)).
 - The clipboard channel pushes every image you copy while attached into the
   sandbox (see [Clipboard](#clipboard-image-paste-for-all-agents)).
 - With the opt-in `voice` module, the agent can record from the host
@@ -395,7 +401,9 @@ kbx ls                              list kbx sandboxes and their sessions
 `kbx-<project>-<short hash of absolute path>`, where the project part is
 the directory basename lower-cased and reduced to `[a-z0-9.-]` (max 32
 chars). The container, both volumes and the
-labels (`kbx.project=/abs/path`) use it.
+labels (`kbx.project=/abs/path`) use it. A profile's sandbox is
+`kbx-profile-<name>`, labelled `kbx.profile=<name>` and `kbx.roots=<JSON list>`
+instead of `kbx.project`.
 
 ### Create (first run for a project)
 
@@ -531,6 +539,51 @@ the guard checks once more and seals the state. Without a seal (the guard died,
 the host rebooted), the next start checks the old baseline before trusting the
 new one, and refuses to start on findings until `kbx resume`.
 
+
+## Profiles: one sandbox for many projects
+
+`[profiles.<name>] roots = [...]` puts every project under those directories
+into one sandbox. Why: one VM's memory instead of one per project, one login
+per context (a work account for work, a personal one for personal projects),
+and shared inner Docker, caches and tools. User guide:
+[docs/profiles.md](docs/profiles.md).
+
+- **Resolution.** The longest root containing the current directory picks the
+  profile; `KBX_PROFILE` overrides (`none`: the project alone). The project is
+  the nearest directory upward with a `.git`, found from the file system
+  without running git, or the current directory. Projects outside every root
+  keep a sandbox of their own, so nothing changes without a profile.
+- **Mounts.** Each root at its own path, whole, so new clones need no
+  recreate. Kata shares bind mounts non-recursively, so a mount nested under a
+  root on the host is not seen; a linked worktree whose repository lies
+  outside the roots gets a warning (git fails in it inside). Roots never
+  include `$HOME` itself or kbx's own state (the guard's baselines must stay
+  out of the agent's reach), and never overlap between profiles. A changed
+  root list applies at `kbx recreate`; until then the guard watches what the
+  container mounts (its `kbx.roots` label), not the config.
+- **Sessions per project.** dtach sockets are `<agent>@<slug>`, the slug being
+  the project's sanitized basename and a 6-hex hash of its path. `KBX_SESSION`
+  carries the same key, so `kbx-notify` keeps per-session state and the host
+  watcher names the project in notifications. A project sandbox keeps plain
+  `<agent>` names. An agent is updated only while no project runs it.
+- **Per project:** private build directories (a store per slug in the home
+  volume), onboarding/trust, the Codex remote-control project, `--since-start`
+  (recorded at the project's first command after a start). **Per profile:** the
+  VM and its lifecycle, logins, the guard, the idle stop.
+- **Guard.** One baseline per root (`guard/<sandbox>/roots/<hash>/`), one
+  process for all, and a finding in any pauses the whole sandbox. A root that
+  is not a repository holds projects: each repository found in it gets the
+  hooks-path and `protect` checks of a checkout, and its `.git` layout is part
+  of the baseline (a `.git` turned into a pointer elsewhere is moved away; one
+  that vanished with its project is no finding). A new repository directly in
+  a root triggers the walk at once; deeper ones are found within a minute.
+  Walks skip dependency and cache directories.
+- **Secrets.** Before a profile's sandbox is created (and for roots added at
+  `recreate`), kbx lists secret-looking files under every root: untracked ones
+  in each repository, any file outside repositories.
+- **Not per profile:** modules and the stage are shared by every sandbox, so a
+  profile cannot enable a module of its own (the stage is one directory
+  mounted into all of them).
 
 ### Private build directories
 

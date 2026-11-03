@@ -13,6 +13,7 @@ import select
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -632,6 +633,57 @@ class KeysTest(DashBase):
         self.assertNotIn(sb.name, self.docker_state()["containers"])
         self.assertEqual(self.docker_state()["volumes"], {})
         self.assertFalse((self.paths.guard_dir / sb.name).exists())
+
+
+class ProfileDashTest(DashBase):
+    """A profile sandbox: one row with its roots, sessions per project."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.work = self.temp / "work"
+        self.api = self.make_repo("work/api")
+        self.web = self.make_repo("work/team/web")
+        self.paths.config_dir.mkdir(parents=True)
+        self.paths.config_file.write_text(f'[profiles.work]\nroots = ["{self.work}"]\n')
+        self.cfg = config.load(self.paths, {})
+        self.sb = sandbox.for_profile("work", (self.work,), self.api)
+        with contextlib.redirect_stdout(io.StringIO()):
+            sandbox.ensure_created(self.docker, self.sb, self.cfg, self.paths)
+            sandbox.ensure_running(self.docker, self.sb, timeout=5)
+
+    def test_profile_row(self) -> None:
+        row = next(iter(status.list_rows(self.docker, self.paths, self.cfg)))
+        self.assertEqual(
+            (row.name, row.profile, row.roots, row.project_dir), (self.sb.name, "work", (self.work,), self.work)
+        )
+        self.assertEqual(row.env, {"KBX_PROFILE": "work"})
+        self.assertFalse(row.orphan)
+        self.assertEqual(status.stale(row, self.cfg, ""), [])
+        self.paths.config_file.write_text(f'[profiles.work]\nroots = ["{self.work}", "{self.temp}/more"]\n')
+        moved = config.load(self.paths, {})
+        self.assertTrue(any("roots changed" in n for n in status.stale(row, moved, "")))
+        live = (sandbox.Sandbox.session_key(self.sb, "claude"), "codex@web-000000")
+        cells = dash.cells(replace(row, sessions=live, activity=("working", "")), self.cfg, snapshot([row]), self.temp)
+        self.assertEqual(cells["PROJECT"], "[work] ~/work")
+        self.assertEqual(cells["SESSIONS"], "claude@api:working,codex@web")
+
+    def test_git_of_projects_with_a_session(self) -> None:
+        projects = status.profile_projects((self.work,))
+        self.assertEqual(sorted(projects.values()), [self.api, self.web])
+        self.assertEqual(
+            status.profile_git(self.docker, self.sb, "", []),
+            ["no agent sessions; projects with one show their git state here"],
+        )
+        web = sandbox.for_profile("work", (self.work,), self.web)
+        lines = status.profile_git(self.docker, self.sb, "2020-01-01T00:00:00Z", [web.session_key("claude")])
+        self.assertEqual(lines[0], f"{self.web} (claude)")
+        self.assertTrue(any("commit(s) on HEAD" in line for line in lines[1:]), lines)
+
+    def test_attach_picks_a_project_session(self) -> None:
+        app = KeysTest.app(self, "2")  # type: ignore[arg-type]
+        row = Row(self.sb.name, self.work, "running", "mount", profile="work", roots=(self.work,),
+                  sessions=("claude@api-111111", "codex@web-222222"))  # fmt: skip
+        self.assertEqual(app.action("\n", row), dash.Action(("attach", "codex@web-222222"), interactive=True))
 
 
 class TerminalTest(DashBase):

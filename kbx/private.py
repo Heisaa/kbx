@@ -6,7 +6,8 @@ side's interpreter), `node_modules` with native add-ons. When both sides use
 the same one, each build invalidates the other's.
 
 For each `[workspace] private` entry, kbx bind-mounts a directory from the
-sandbox's home volume over it, inside the VM only. The host keeps its own
+sandbox's home volume over it, inside the VM only (one per project in a
+profile sandbox, so two projects never share a `target/`). The host keeps its own
 directory and never sees the sandbox's; in the sandbox the path is unchanged,
 so `./target/debug/app` and `.venv/bin/python` work as usual. It happens at
 each launch (idempotent; mounts end with the container).
@@ -36,19 +37,25 @@ MARKERS: dict[str, tuple[str, ...]] = {
     "node_modules": ("package.json",),
 }
 
-# As root in the sandbox: $1 the project, then the entries to make private.
+# As root in the sandbox: $1 the store, $2 the project, then the entries to make private.
 SCRIPT = r"""
-project=$1
-shift
+# kbx-private: bind the sandbox's own directories over shared build directories
+store_dir=$1 project=$2
+shift 2
 status=0
 for rel in "$@"; do
-  target="$project/$rel" store="__STORE__/$rel"
+  target="$project/$rel" store="$store_dir/$rel"
   if [ -L "$target" ]; then echo "$rel is a symlink" >&2; status=1; continue; fi
   if mountpoint -q "$target" 2>/dev/null; then continue; fi
   runuser -u agent -- mkdir -p "$store" "$target" && mount --bind "$store" "$target" || status=1
 done
 exit $status
-""".replace("__STORE__", STORE)
+"""
+
+
+def store(sandbox: Sandbox) -> str:
+    """Where the sandbox keeps its own copies: one directory per project of a profile."""
+    return f"{STORE}/{sandbox.slug}" if sandbox.profile else STORE
 
 
 def applies(project: Path, rel: str) -> bool:
@@ -75,7 +82,11 @@ def mount(docker: Docker, sandbox: Sandbox, entries: Sequence[str]) -> list[str]
     if not rels:
         return notes
     result = docker.exec(
-        sandbox.name, ["sh", "-c", SCRIPT, "sh", str(sandbox.project_dir), *rels], user=ROOT, check=False, timeout=60
+        sandbox.name,
+        ["sh", "-c", SCRIPT, "sh", store(sandbox), str(sandbox.project_dir), *rels],
+        user=ROOT,
+        check=False,
+        timeout=60,
     )
     if result.returncode != 0:
         detail = (result.stderr.decode("utf-8", "replace").strip().splitlines() or ["no output"])[-1]

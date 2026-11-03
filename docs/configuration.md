@@ -16,7 +16,7 @@ run `kbx check` after editing.
 | user modules | `$XDG_CONFIG_HOME/kbx/modules/<name>/` |
 | stage (mounted read-only into sandboxes) | `$XDG_DATA_HOME/kbx/stage/` (`~/.local/share/kbx/`) |
 | logs (clipboard watcher, voice link, guard) | `$XDG_DATA_HOME/kbx/log/` |
-| guard baselines, trusted copies, quarantine | `$XDG_DATA_HOME/kbx/guard/<sandbox>/` |
+| guard baselines, trusted copies, quarantine | `$XDG_DATA_HOME/kbx/guard/<sandbox>/` (a profile: `roots/<hash>/` per root) |
 | runtime (clipd and guard pidfiles) | `$XDG_RUNTIME_DIR/kbx/` |
 | built-in modules | `<checkout>/modules/`, found relative to the resolved `bin/kbx` |
 
@@ -87,6 +87,26 @@ selection and verification.
 
 See [git-workflow.md](git-workflow.md) for what each mode means in practice.
 
+## `[profiles.<name>]`
+
+One sandbox for every project under some directories. See
+[profiles.md](profiles.md) for the workflow and what it shares.
+
+```toml
+[profiles.work]
+roots = ["~/work", "~/src/acme"]
+memory = "16g"
+```
+
+| Setting | |
+| --- | --- |
+| `roots` | Required. Directories mounted at their own path into the profile's sandbox (`kbx-profile-<name>`). A directory under a root uses this profile; the longest matching root wins. Not your home directory or a directory containing it, not kbx's own config or data, and no overlap with another root of any profile |
+| `memory`, `cpus`, `idle_stop` | `[launcher]` settings for this profile's sandbox (the global ones otherwise) |
+| `private`, `protect` | `[workspace]` settings for this profile's projects |
+
+A profile is always in mount mode. Names are 1-32 characters of `a-z`, `0-9`
+and `-`.
+
 ## `[skills]`
 
 ```toml
@@ -156,7 +176,8 @@ start a new agent session.
 | --- | --- |
 | `KBX_<LAUNCHER_SETTING>` | Per-run override of a `[launcher]` setting |
 | `KBX_IMAGE`, `KBX_RUNTIME` | Per-run image and runtime name |
-| `KBX_WORKSPACE`, `KBX_GUARD` | Per-run `[workspace] mode` and `guard` (the mode only matters when the sandbox is created) |
+| `KBX_WORKSPACE`, `KBX_GUARD` | Per-run `[workspace] mode` and `guard` (the mode only matters when the sandbox is created; profiles refuse `clone`) |
+| `KBX_PROFILE` | `<name>`: use that profile (outside its roots, work in its first root). `none`: a sandbox for this project alone, even under a profile's root |
 | `KBX_DEBUG=1` | Tracebacks for errors, and `claude --debug` |
 | `KBX_DOCKER` | Path or name of the docker CLI |
 | `KBX_UNSAFE_NO_FIREWALL_CHECK=1` | Skip the launch-time firewall check. Only for development with `runc` on a machine without the firewall |
@@ -169,4 +190,5 @@ start a new agent session.
 | A module's `build.sh` or build options, enabling a module with `build.sh` | `kbx build && kbx recreate` (kbx warns at launch) |
 | `memory`, `cpus`, `dns`, runtime, network, `[workspace] mode` | `kbx recreate` |
 | `[workspace] protect` | Next sandbox start |
+| A profile's `roots` | `kbx recreate` (kbx warns until then; the guard watches what is mounted) |
 | `auto_update`, `remote_control`, `detach_key`, `debug` | Next launch |

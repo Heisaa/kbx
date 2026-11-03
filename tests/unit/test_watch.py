@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -37,6 +38,17 @@ class ParseTest(unittest.TestCase):
         empty = event(message="")
         assert empty is not None
         self.assertEqual(watch.notification(empty, Path("/p")), ("claude is done · p", "finished its turn"))
+
+    def test_profile_sessions(self) -> None:
+        found = event(session="claude@api-1a2b3c", state="waiting")
+        assert found is not None
+        self.assertEqual(found.key, "claude@api-1a2b3c")
+        self.assertEqual(watch.notification(found, Path("/home/me/work"))[0], "claude needs you · api")
+        self.assertIsNone(event(session="codex@api-1a2b3c"), "the session must be the agent's")
+        self.assertIsNone(event(session="claude@../x"))
+        self.assertEqual(event(session="claude"), event())
+        sessions = watch.parse_sessions({"sessions": {"claude@api-1a2b3c": {}, "x@y": {}, "pi": {}}})
+        self.assertEqual(sorted(sessions), ["claude@api-1a2b3c", "pi"])
 
 
 class NotifierTest(unittest.TestCase):
@@ -253,3 +265,30 @@ class DashTest(TempHome):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProfileWatcherTest(TempHome):
+    def test_a_profile_uses_its_own_idle_stop(self) -> None:
+        work = self.temp / "work"
+        work.mkdir()
+        p = paths.resolve(os.environ)
+        p.config_dir.mkdir(parents=True)
+        p.config_file.write_text(
+            f'[launcher]\nidle_stop = "1h"\n[profiles.work]\nroots = ["{work}"]\nidle_stop = "2h"\n'
+        )
+        cfg = config.load(p, {"KBX_NOTIFY": "off"})
+
+        class Docker(StubDocker):
+            def inspect(self, kind: str, name: str) -> dict[str, Any]:
+                labels = {
+                    sandbox.LABEL_PROFILE: "work",
+                    sandbox.LABEL_ROOTS: json.dumps([str(work)]),
+                    sandbox.LABEL_WORKSPACE: "mount",
+                }
+                return {"State": {"Status": self.status}, "Config": {"Labels": labels}}
+
+        found = watch.Watcher(p, "kbx-profile-work", Docker(), cfg)  # type: ignore[arg-type]
+        self.assertEqual(found.idle.limit, 7200)
+        self.assertEqual(found.sandbox.profile, "work")
+        self.assertEqual(found.sandbox.roots, (work,))
+        self.assertEqual(found.title, "profile work")

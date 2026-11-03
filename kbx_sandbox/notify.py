@@ -6,9 +6,10 @@ The agents call it from their own hooks (seeded by the `notify` module):
   kbx-notify codex JSON      Codex's `notify` program, with the event as argument
 
 Each call records the session's state (working, waiting for you, done) in
-/run/kbx/agents/<agent>.json and appends it to /run/kbx/agents/events.jsonl.
-Only sessions the launcher started count: it sets KBX_SESSION=<agent> in them,
-so an agent run by hand in `kbx shell` stays quiet.
+/run/kbx/agents/<session>.json and appends it to /run/kbx/agents/events.jsonl.
+Only sessions the launcher started count: it sets KBX_SESSION to the session's
+key in them (`claude`, or `claude@<project>` in a profile sandbox, see
+kbx-session), so an agent run by hand in `kbx shell` stays quiet.
 
   kbx-notify follow          for the host: every new event as a JSON line, and
                              the live sessions every TICK seconds
@@ -44,19 +45,21 @@ def _message(value: object) -> str:
     return text if len(text) <= MAX_MESSAGE else text[: MAX_MESSAGE - 1] + "…"
 
 
-def current(agent: str, root: Path = STATES) -> str | None:
+def current(key: str, root: Path = STATES) -> str | None:
     try:
-        return json.loads((root / f"{agent}.json").read_text(encoding="utf-8")).get("state")
+        return json.loads((root / f"{key}.json").read_text(encoding="utf-8")).get("state")
     except (OSError, ValueError, AttributeError):
         return None
 
 
-def record(agent: str, state: str, message: str = "", root: Path = STATES) -> None:
-    event = {"agent": agent, "state": state, "message": _message(message), "at": time.time()}
+def record(agent: str, state: str, message: str = "", root: Path = STATES, key: str = "") -> None:
+    """`key`: the session (default: the agent's own, as in a project sandbox)."""
+    key = key or agent
+    event = {"agent": agent, "session": key, "state": state, "message": _message(message), "at": time.time()}
     line = json.dumps(event) + "\n"
-    temp = root / f".{agent}.json.tmp"
+    temp = root / f".{key}.json.tmp"
     temp.write_text(line, encoding="utf-8")
-    os.replace(temp, root / f"{agent}.json")
+    os.replace(temp, root / f"{key}.json")
     events = root / EVENTS.name
     try:
         if events.stat().st_size > MAX_EVENTS:
@@ -94,21 +97,22 @@ def codex_state(event: Mapping[str, Any]) -> tuple[str, str] | None:
 
 
 def hook(agent: str, raw: str, env: Mapping[str, str], root: Path = STATES) -> None:
-    if env.get("KBX_SESSION") != agent:
+    key = env.get("KBX_SESSION", "")
+    if not session.valid(key) or key.partition("@")[0] != agent:
         return
     event = json.loads(raw)
     if not isinstance(event, dict):
         return
     if agent == "claude" and event.get("hook_event_name") == "SessionEnd":
-        (root / "claude.json").unlink(missing_ok=True)
+        (root / f"{key}.json").unlink(missing_ok=True)
         return
     found = claude_state(event) if agent == "claude" else codex_state(event)
     if found is None:
         return
     state, message = found
-    if state == WORKING and current(agent, root) == WORKING:
+    if state == WORKING and current(key, root) == WORKING:
         return  # PostToolUse fires for every tool; write only on a change
-    record(agent, state, message, root)
+    record(agent, state, message, root, key)
 
 
 def _emit(data: Mapping[str, Any]) -> None:
@@ -143,8 +147,10 @@ def follow(root: Path = STATES, tick: float = TICK, poll: float = POLL) -> None:
                 except ValueError:
                     continue
                 if isinstance(event, dict):
-                    agent = str(event.get("agent", ""))
-                    event["attached"] = session.attached(session.SESSIONS / f"{agent}.sock")
+                    key = str(event.get("session") or event.get("agent", ""))
+                    if not session.valid(key):
+                        continue
+                    event["attached"] = session.attached(session.SESSIONS / f"{key}.sock")
                     _emit({"type": "event", **event})
         if time.monotonic() >= next_tick:
             next_tick = time.monotonic() + tick

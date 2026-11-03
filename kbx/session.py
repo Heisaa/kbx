@@ -3,6 +3,10 @@
 dtach keeps each agent running on a socket in /run/kbx/sessions and does
 nothing else: no prefix key, no panes, no scrollback. The only key it
 intercepts is the detach key, which can be disabled.
+
+A session is named by its key: the agent in a project sandbox (`claude`), the
+agent and project in a profile sandbox (`claude@api-1a2b3c`, see
+Sandbox.session_key), so each project of a profile has sessions of its own.
 """
 
 from __future__ import annotations
@@ -19,8 +23,8 @@ SESSIONS = "/run/kbx/sessions"
 DISPLAY = ":0"
 
 
-def socket_path(agent: str) -> str:
-    return f"{SESSIONS}/{agent}.sock"
+def socket_path(key: str) -> str:
+    return f"{SESSIONS}/{key}.sock"
 
 
 def _detach_flags(detach_key: str) -> list[str]:
@@ -29,17 +33,17 @@ def _detach_flags(detach_key: str) -> list[str]:
     return ["-e", detach_key]
 
 
-def dtach_start(agent: str, detach_key: str, argv: Sequence[str]) -> list[str]:
+def dtach_start(key: str, detach_key: str, argv: Sequence[str]) -> list[str]:
     """Start-or-attach: `-A` creates the session if the socket has no master."""
-    return ["dtach", "-A", socket_path(agent), *_detach_flags(detach_key), "-r", "winch", *argv]
+    return ["dtach", "-A", socket_path(key), *_detach_flags(detach_key), "-r", "winch", *argv]
 
 
-def dtach_attach(agent: str, detach_key: str) -> list[str]:
-    return ["dtach", "-a", socket_path(agent), *_detach_flags(detach_key), "-r", "winch"]
+def dtach_attach(key: str, detach_key: str) -> list[str]:
+    return ["dtach", "-a", socket_path(key), *_detach_flags(detach_key), "-r", "winch"]
 
 
-def alive(docker: Docker, sandbox: Sandbox, agent: str) -> bool:
-    return docker.exec(sandbox.name, ["kbx-session", "alive", agent], check=False, timeout=15).returncode == 0
+def alive(docker: Docker, sandbox: Sandbox, key: str) -> bool:
+    return docker.exec(sandbox.name, ["kbx-session", "alive", key], check=False, timeout=15).returncode == 0
 
 
 def session_env(extra: Mapping[str, str]) -> dict[str, str]:

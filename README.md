@@ -6,6 +6,11 @@ with Claude Code, Codex and pi installed and a full Docker engine. Your checkout
 is mounted into it: you and the agent edit and commit in the same repository,
 and you push from the host yourself.
 
+Or put several projects into one sandbox with a **profile**: for example one VM
+for every project under `~/work`, and another for your personal projects, each
+with its own logins. Each project still gets its own agent sessions. See
+[docs/profiles.md](docs/profiles.md).
+
 Nothing else from your machine goes in: no SSH keys or agent socket, no cloud
 credentials or tokens, no other part of `$HOME`, and no network path to the host
 or your LAN. The internet stays open. A guard on the host keeps the agent from
@@ -72,7 +77,7 @@ change back if it was yours. See [docs/git-workflow.md](docs/git-workflow.md).
 | Command | Does |
 | --- | --- |
 | `kbx claude\|codex\|pi [args…]` | create/start the sandbox, update the agent, attach (reattach if running) |
-| `kbx attach [agent]` | reattach to a running session |
+| `kbx attach [agent\|session]` | reattach to a running session (in a profile: this project's, or any by its `kbx ls` name) |
 | `kbx shell` | bash in the sandbox, as `agent` |
 | `kbx start` | create/start the sandbox without attaching |
 | `kbx resume [--accept]` | after the guard paused the sandbox: show what it stopped, resume |
@@ -134,7 +139,9 @@ agent wrote is untrusted** (run it in the sandbox, not on the host); the guard
 reacts within milliseconds but does not block the write itself, and only
 protects while it runs; while you are attached, images you copy on the host
 are pushed into that sandbox for pasting; and with the opt-in `voice` module,
-the agent can record from your microphone while you are attached. Clone mode (`[workspace] mode =
+the agent can record from your microphone while you are attached. In a profile, every agent can read and change
+every project under its roots ([docs/profiles.md](docs/profiles.md#security-what-a-profile-shares)).
+Clone mode (`[workspace] mode =
 "clone"`) keeps the checkout out entirely and git crosses only as bundles. Full
 details: [PLAN.md](PLAN.md#threat-model).
 
@@ -142,6 +149,7 @@ details: [PLAN.md](PLAN.md#threat-model).
 
 - [docs/host-setup.md](docs/host-setup.md): Kata, Docker runtime, firewall, spike checks
 - [docs/configuration.md](docs/configuration.md): `~/.config/kbx/config.toml`
+- [docs/profiles.md](docs/profiles.md): one sandbox for many projects (`[profiles.<name>]`)
 - [docs/modules.md](docs/modules.md): module format, seeds, writing your own
 - [docs/git-workflow.md](docs/git-workflow.md): mount mode and the guard, clone mode (fetch/sync), worktrees
 - [docs/dashboard.md](docs/dashboard.md): `kbx dash`, what it shows and its keys

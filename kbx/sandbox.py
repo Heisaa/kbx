@@ -10,7 +10,8 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,8 @@ LABEL_PROJECT = "kbx.project"
 LABEL_NAME = "kbx.name"
 LABEL_WORKSPACE = "kbx.workspace"
 LABEL_GITDIR = "kbx.gitdir"
+LABEL_PROFILE = "kbx.profile"
+LABEL_ROOTS = "kbx.roots"  # a profile's mounted roots, as a JSON list
 READY_TIMEOUT = 600.0
 FIREWALL_PORT = 9  # discard: nothing should answer, and nothing may reach it
 
@@ -43,11 +46,39 @@ SYSTEM_PARENTS = ("/", "/home", HOME, "/opt", "/var", "/var/lib", "/root", "/tmp
 
 @dataclass(frozen=True)
 class Sandbox:
+    """One VM, and the project this command works in.
+
+    A project sandbox (no profile) mounts its one checkout. A profile sandbox
+    mounts the profile's roots, and every project inside them (a git repository,
+    or the directory kbx runs in) works in that one VM with sessions of its own.
+    """
+
     name: str
     project: str
     project_dir: Path
     # "mount" (the host checkout, at the same path) or "clone" (see config.py).
     mode: str = "clone"
+    profile: str = ""
+    profile_roots: tuple[Path, ...] = ()
+
+    @property
+    def roots(self) -> tuple[Path, ...]:
+        """Host directories mounted at their own path (mount mode)."""
+        return self.profile_roots if self.profile else (self.project_dir,)
+
+    @property
+    def slug(self) -> str:
+        """The project's part of session names in a profile sandbox."""
+        return project_slug(self.project_dir)
+
+    def session_key(self, agent: str) -> str:
+        """The dtach session of `agent` in this project. A project sandbox has one
+        session per agent, named after it; a profile sandbox one per agent and project."""
+        return f"{agent}@{self.slug}" if self.profile else agent
+
+    def owns_session(self, key: str) -> bool:
+        """Whether a live session belongs to this project."""
+        return key.partition("@")[2] == self.slug if self.profile else "@" not in key
 
     @property
     def clone_dir(self) -> str:
@@ -74,11 +105,61 @@ def sanitize(basename: str) -> str:
     return text or "project"
 
 
+def project_slug(project_dir: Path) -> str:
+    """A profile project in session names: readable, and unique by its path."""
+    digest = hashlib.sha256(str(project_dir).encode()).hexdigest()[:6]
+    return f"{sanitize(project_dir.name)[:24]}-{digest}"
+
+
 def for_project(project_dir: Path, mode: str = "clone") -> Sandbox:
     absolute = project_dir.resolve()
     project = sanitize(absolute.name)
     digest = hashlib.sha256(str(absolute).encode()).hexdigest()[:8]
     return Sandbox(name=f"kbx-{project}-{digest}", project=project, project_dir=absolute, mode=mode)
+
+
+def profile_name(profile: str) -> str:
+    return f"kbx-profile-{profile}"
+
+
+def for_profile(profile: str, roots: Sequence[Path], project_dir: Path) -> Sandbox:
+    """The profile's sandbox, working in `project_dir` (inside one of the roots)."""
+    absolute = project_dir.resolve()
+    return Sandbox(
+        name=profile_name(profile),
+        project=sanitize(absolute.name),
+        project_dir=absolute,
+        mode="mount",
+        profile=profile,
+        profile_roots=tuple(roots),
+    )
+
+
+_SESSION = re.compile(r"^(claude|codex|pi)(@[a-z0-9][a-z0-9.-]{0,39})?$")
+
+
+def valid_session(key: object) -> bool:
+    return isinstance(key, str) and _SESSION.match(key) is not None
+
+
+def session_agent(key: str) -> str:
+    return key.partition("@")[0]
+
+
+def slug_name(slug: str) -> str:
+    """A project slug without its hash."""
+    return slug.rpartition("-")[0] or slug
+
+
+def session_label(key: str) -> str:
+    """How a session is shown: `claude`, or `claude@api` (the project, without its hash)."""
+    agent, at, slug = key.partition("@")
+    return f"{agent}@{slug_name(slug)}" if at else agent
+
+
+def root_of(sandbox: Sandbox, path: Path) -> Path | None:
+    """The mounted root `path` lies in, if any."""
+    return next((root for root in sandbox.roots if _inside(root, path)), None)
 
 
 def _inside(parent: Path, path: Path) -> bool:
@@ -113,9 +194,24 @@ def git_dirs(root: Path) -> tuple[Path, Path]:
 
 
 def shared_gitdir(sandbox: Sandbox) -> Path | None:
-    """Mount mode: the repository directory outside the checkout that is mounted too."""
+    """Mount mode: the repository directory outside the checkout that is mounted too.
+    A profile mounts its roots only, never a directory outside them."""
+    if sandbox.profile:
+        return None
     _, common = git_dirs(sandbox.project_dir)
     return None if _inside(sandbox.project_dir, common) else common
+
+
+def unreachable_gitdir(sandbox: Sandbox) -> Path | None:
+    """Profile: a linked worktree whose repository lies outside every root (git
+    fails in it inside the sandbox). None when git works, or the project has none."""
+    if not sandbox.profile or not (sandbox.project_dir / ".git").exists():
+        return None
+    try:
+        _, common = git_dirs(sandbox.project_dir)
+    except KbxError:
+        return None
+    return None if any(_inside(root, common) for root in sandbox.roots) else common
 
 
 def _check_path(text: str) -> None:
@@ -132,9 +228,10 @@ def _check_path(text: str) -> None:
 
 
 def check_mountable(sandbox: Sandbox) -> None:
-    """Mount mode: the checkout (and its repository directory, if that lies
-    elsewhere) at paths that shadow nothing in the guest."""
-    _check_path(str(sandbox.project_dir))
+    """Mount mode: the checkout or the profile's roots (and the repository
+    directory, if that lies elsewhere) at paths that shadow nothing in the guest."""
+    for root in sandbox.roots:
+        _check_path(str(root))
     shared = shared_gitdir(sandbox)
     if shared is not None:
         _check_path(str(shared))
@@ -225,20 +322,24 @@ def create_args(sandbox: Sandbox, config: Config, paths: Paths) -> list[str]:
         "--mount", f"type=bind,source={paths.stage},target=/opt/kbx/stage,readonly",
     ]  # fmt: skip
     if sandbox.mode == "mount":
+        for root in sandbox.roots:
+            args += ["--mount", f"type=bind,source={root},target={root}"]
         # kbx-init gives `agent` these ids, so files keep their owner on both sides.
-        args += [
-            "--mount", f"type=bind,source={sandbox.project_dir},target={sandbox.project_dir}",
-            "-e", f"KBX_HOST_UID={os.getuid()}",
-            "-e", f"KBX_HOST_GID={os.getgid()}",
-        ]  # fmt: skip
+        args += ["-e", f"KBX_HOST_UID={os.getuid()}", "-e", f"KBX_HOST_GID={os.getgid()}"]
         shared = shared_gitdir(sandbox)
         if shared is not None:
             # A linked worktree: git inside needs the main repository's .git,
             # at the path the worktree's .git file names. Only that directory:
             # the main checkout's files stay out.
             args += ["--mount", f"type=bind,source={shared},target={shared}", "--label", f"{LABEL_GITDIR}={shared}"]
+    if sandbox.profile:
+        args += [
+            "--label", f"{LABEL_PROFILE}={sandbox.profile}",
+            "--label", f"{LABEL_ROOTS}={json.dumps([str(root) for root in sandbox.roots])}",
+        ]  # fmt: skip
+    else:
+        args += ["--label", f"{LABEL_PROJECT}={sandbox.project_dir}"]
     args += [
-        "--label", f"{LABEL_PROJECT}={sandbox.project_dir}",
         "--label", f"{LABEL_NAME}={sandbox.name}",
         "--label", f"{LABEL_WORKSPACE}={sandbox.mode}",
         config.image.name,
@@ -252,11 +353,44 @@ def state(docker: Docker, sandbox: Sandbox) -> str | None:
     if data is None:
         return None
     labels = (data.get("Config") or {}).get("Labels") or {}
-    if labels.get(LABEL_PROJECT) != str(sandbox.project_dir):
-        raise KbxError(
-            f"container {sandbox.name} exists but belongs to {labels.get(LABEL_PROJECT)!r}; refusing to use it"
-        )
+    if sandbox.profile:
+        if labels.get(LABEL_PROFILE) != sandbox.profile:
+            raise KbxError(
+                f"container {sandbox.name} exists but is not kbx profile {sandbox.profile!r}; refusing to use it"
+            )
+    elif labels.get(LABEL_PROJECT) != str(sandbox.project_dir) or labels.get(LABEL_PROFILE):
+        owner = labels.get(LABEL_PROJECT) or f"profile {labels.get(LABEL_PROFILE)}"
+        raise KbxError(f"container {sandbox.name} exists but belongs to {owner!r}; refusing to use it")
     return str((data.get("State") or {}).get("Status", "unknown"))
+
+
+def labels(docker: Docker, name: str) -> dict[str, str]:
+    data = docker.inspect("container", name) or {}
+    found = (data.get("Config") or {}).get("Labels") or {}
+    return {str(k): str(v) for k, v in found.items()}
+
+
+def mounted_roots(found: Mapping[str, str]) -> tuple[Path, ...]:
+    """A profile container's roots, from its labels."""
+    try:
+        data = json.loads(found.get(LABEL_ROOTS) or "[]")
+    except ValueError:
+        return ()
+    return tuple(Path(item) for item in data if isinstance(item, str)) if isinstance(data, list) else ()  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
+
+
+def from_labels(name: str, found: Mapping[str, str]) -> Sandbox:
+    """The sandbox an existing container is, from its labels (for host daemons and
+    the dashboard, which have no working directory). A profile's project is its first root."""
+    mode = str(found.get(LABEL_WORKSPACE) or "clone")
+    profile = found.get(LABEL_PROFILE) or ""
+    if profile:
+        roots = mounted_roots(found)
+        first = roots[0] if roots else Path("/")
+        return Sandbox(name, sanitize(first.name), first, "mount", profile, roots)
+    project = Path(found.get(LABEL_PROJECT) or "/")
+    sb = for_project(project, mode) if project != Path("/") else Sandbox(name, name, project, mode)
+    return sb if sb.name == name else replace(sb, name=name)
 
 
 def ensure_created(docker: Docker, sandbox: Sandbox, config: Config, paths: Paths) -> bool:
@@ -432,21 +566,27 @@ def remove_volumes(docker: Docker, sandbox: Sandbox) -> None:
 
 
 def list_sandboxes(docker: Docker) -> list[dict[str, str]]:
+    """Each kbx container: name, state, project (empty for a profile) and profile
+    (empty for a project sandbox)."""
     out = docker.text(
         [
             "ps", "-a", "--filter", f"label={LABEL_NAME}",
-            "--format", "{{.Names}}\t{{.State}}\t{{.Label \"" + LABEL_PROJECT + "\"}}",
+            "--format",
+            "{{.Names}}\t{{.State}}\t{{.Label \"" + LABEL_PROJECT + "\"}}\t{{.Label \"" + LABEL_PROFILE + "\"}}",
         ]
     )  # fmt: skip
     rows: list[dict[str, str]] = []
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) == 3:
-            rows.append({"name": parts[0], "state": parts[1], "project": parts[2]})
+            parts.append("")
+        if len(parts) == 4:
+            rows.append({"name": parts[0], "state": parts[1], "project": parts[2], "profile": parts[3]})
     return rows
 
 
 def sessions(docker: Docker, name: str) -> list[str]:
+    """Live session names (`claude`, or `claude@<project>` in a profile); untrusted, so checked."""
     result = docker.exec(name, ["kbx-session", "list"], check=False, timeout=15)
     if result.returncode != 0:
         return []
@@ -454,7 +594,7 @@ def sessions(docker: Docker, name: str) -> list[str]:
         data = json.loads(result.stdout)
     except ValueError:
         return []
-    return [str(item) for item in data] if isinstance(data, list) else []  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
+    return [str(item) for item in data if valid_session(item)] if isinstance(data, list) else []  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
 
 
 def session_states(docker: Docker, name: str) -> dict[str, str]:
@@ -470,7 +610,9 @@ def session_states(docker: Docker, name: str) -> dict[str, str]:
     if not isinstance(data, dict):
         return {agent: "" for agent in sessions(docker, name)}
     states: dict[str, str] = {}
-    for agent, info in data.items():  # pyright: ignore[reportUnknownVariableType]
+    for key, info in data.items():  # pyright: ignore[reportUnknownVariableType]
+        if not valid_session(key):
+            continue
         state = info.get("state") if isinstance(info, dict) else None  # pyright: ignore[reportUnknownMemberType]
-        states[str(agent)] = state if state in ("working", "waiting", "done") else ""  # pyright: ignore[reportUnknownArgumentType]
+        states[str(key)] = state if state in ("working", "waiting", "done") else ""  # pyright: ignore[reportUnknownArgumentType]
     return states

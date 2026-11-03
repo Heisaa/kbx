@@ -38,7 +38,8 @@ Image and config
 | STATE | the container's state. `paused` usually means the guard stopped the agent |
 | MODE | `mount` (your checkout) or `clone` (a private clone) |
 | GUARD | `watching`; **`ALERT`**: the guard neutralized a change, see the details; **`UNGUARDED`**: a running mount-mode sandbox with no guard process, press `S`; `off`: disabled in the config |
-| SESSIONS | the agents running in dtach sessions, with what each is doing when the `notify` module reports it: `working`, `waiting` (for an approval or answer; the row is highlighted) or `done` (its turn ended). Codex reports only the end of a turn and approval requests, so it can show `done` while it works on your next prompt |
+| PROJECT | the project, or for a [profile](profiles.md) its name and roots (`[work] ~/work, ~/src/acme`) |
+| SESSIONS | the agents running in dtach sessions (in a profile, per project: `claude@api`), with what each is doing when the `notify` module reports it: `working`, `waiting` (for an approval or answer; the row is highlighted) or `done` (its turn ended). Codex reports only the end of a turn and approval requests, so it can show `done` while it works on your next prompt |
 | CPU, MEM | from `docker stats`, running sandboxes only |
 | FLAGS | `stale`: recreate to pick up the current image or mode; `orphan`: the project directory is gone; `health`: a module failed |
 
@@ -50,7 +51,8 @@ For the selected sandbox:
 - **Health:** failed seeds, `start.sh` and services from the last start.
 - **Git:** mount mode: commits on `HEAD` since the sandbox started and
   uncommitted paths. Clone mode: unfetched branches, uncommitted changes and
-  stashes in the sandbox clone.
+  stashes in the sandbox clone. A profile: the same for each project with a
+  running session (projects up to two levels below a root).
 - **Agents:** installed versions and whether each agent is logged in. `U` looks up the latest published versions
   on the npm registry (a request from the host, only when you press it). Also
   the Codex remote-control daemon's status, and a note when it still runs an
@@ -60,6 +62,12 @@ For the selected sandbox:
   (`kbx recreate`).
 
 The details refresh every 15 seconds while selected; `g` refreshes now.
+
+Commands on a profile's row run in its first root with `KBX_PROFILE` set, so
+they act on the profile's sandbox. Enter attaches to a session, asking which by
+number when several projects have one. `c`, `x` and `p` start an agent in that
+first root. To start one in a particular project, run `kbx claude` in its
+directory.
 
 ## Keys
 

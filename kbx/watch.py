@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
@@ -106,11 +106,19 @@ class Event:
     state: str
     message: str
     attached: bool
+    session: str = ""  # the session key; "" means the agent's own (a project sandbox)
+
+    @property
+    def key(self) -> str:
+        return self.session or self.agent
 
 
 def parse_event(data: Mapping[str, Any]) -> Event | None:
     agent, state = data.get("agent"), data.get("state")
     if agent not in agents.AGENTS or state not in STATES:
+        return None
+    key = data.get("session") or agent
+    if not sandbox_mod.valid_session(key) or sandbox_mod.session_agent(str(key)) != agent:
         return None
     message = data.get("message")
     return Event(
@@ -118,6 +126,7 @@ def parse_event(data: Mapping[str, Any]) -> Event | None:
         state=str(state),
         message=clean(message)[:MAX_BODY] if isinstance(message, str) else "",
         attached=data.get("attached") is True,
+        session=str(key) if key != agent else "",
     )
 
 
@@ -125,7 +134,7 @@ def parse_sessions(data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     sessions = data.get("sessions")
     if not isinstance(sessions, dict):
         return {}
-    return {str(k): v for k, v in sessions.items() if k in agents.AGENTS and isinstance(v, dict)}  # pyright: ignore[reportUnknownVariableType]
+    return {str(k): v for k, v in sessions.items() if sandbox_mod.valid_session(k) and isinstance(v, dict)}  # pyright: ignore[reportUnknownVariableType]
 
 
 # --- notifications ---
@@ -137,8 +146,10 @@ def _markup(text: str) -> str:
 
 
 def notification(event: Event, project: Path) -> tuple[str, str]:
+    """`project`: the sandbox's; a profile session names its own project instead."""
     what = "needs you" if event.state == "waiting" else "is done"
-    title = clean(f"{event.agent} {what} · {project.name}")[:MAX_TITLE]
+    where = sandbox_mod.session_label(event.session).partition("@")[2] if event.session else project.name
+    title = clean(f"{event.agent} {what} · {where}")[:MAX_TITLE]
     default = "waiting for your answer" if event.state == "waiting" else "finished its turn"
     return title, _markup(event.message or default)
 
@@ -167,13 +178,13 @@ class Notifier:
             return False
         if self.mode == "detached" and event.attached:
             return False
-        last = self.recent.get(event.agent)
+        last = self.recent.get(event.key)
         if last and last[:2] == (event.state, event.message) and now - last[2] < REPEAT_WINDOW:
             return False
         self.sent_at = [at for at in self.sent_at if now - at < 60]
         if len(self.sent_at) >= MAX_PER_MINUTE:
             return False
-        self.recent[event.agent] = (event.state, event.message, now)
+        self.recent[event.key] = (event.state, event.message, now)
         self.sent_at.append(now)
         sent = send(*notification(event, self.project))
         if not sent and not self.warned:
@@ -231,17 +242,17 @@ class Watcher:
         self.name = name
         self.docker = docker
         self.config = config
-        data = docker.inspect("container", name) or {}
-        labels = ((data.get("Config") or {}).get("Labels")) or {}
-        self.project = Path(str(labels.get(sandbox_mod.LABEL_PROJECT) or "/"))
-        self.mode = str(labels.get(sandbox_mod.LABEL_WORKSPACE) or "clone")
+        self.sandbox: Sandbox = sandbox_mod.from_labels(name, sandbox_mod.labels(docker, name))
+        if self.sandbox.profile in config.profiles:
+            self.config = config = config.for_profile(self.sandbox.profile)  # its own idle_stop
+        self.project = self.sandbox.project_dir
+        self.mode = self.sandbox.mode
         self.notifier = Notifier(config.launcher.notify, self.project)
         self.idle = Idle(float(config.launcher.idle_stop), time.monotonic())
 
     @property
-    def sandbox(self) -> Sandbox:
-        sb = sandbox_mod.for_project(self.project, self.mode)
-        return sb if sb.name == self.name else replace(sb, name=self.name)
+    def title(self) -> str:
+        return f"profile {self.sandbox.profile}" if self.sandbox.profile else self.project.name
 
     def state(self) -> str:
         data = self.docker.inspect("container", self.name)
@@ -262,7 +273,7 @@ class Watcher:
             if event is not None:
                 self.idle.active(now)
                 if self.notifier.handle(event, time.time()):
-                    log(f"notified: {event.agent} {event.state}")
+                    log(f"notified: {event.key} {event.state}")
 
     def check(self) -> bool:
         """Every CHECK_INTERVAL. False when the watcher should end."""
@@ -280,7 +291,7 @@ class Watcher:
 
     def stop_idle(self) -> bool:
         """True if the sandbox was stopped."""
-        if guard.Guard(self.paths, self.name).alert_file.exists():
+        if guard.alerted(self.paths, self.name):
             return False
         minutes = round(self.idle.limit / 60)
         log(f"idle for {minutes} min (no agent session, no shell); stopping")
@@ -291,12 +302,12 @@ class Watcher:
             self.idle.active(time.monotonic())
             return False
         if self.mode == "mount" and self.config.workspace.guard:
-            actions = guard.Guard(self.paths, self.name).seal()
+            actions = guard.seal(self.paths, self.name)
             if actions:
                 log(f"guard: {guard.summary(actions)}")
         if self.config.launcher.notify != "off" and self.idle.limit >= QUIET_STOP:
             send(
-                clean(f"kbx stopped {self.project.name}")[:MAX_TITLE],
+                clean(f"kbx stopped {self.title}")[:MAX_TITLE],
                 f"Idle for {minutes} min. It starts again at the next kbx command.",
             )
         return True
@@ -365,8 +376,8 @@ class Watcher:
 
 def run(paths: Paths, name: str) -> int:
     """`kbx _watch NAME`."""
-    config = config_mod.load(paths, os.environ)
-    watcher = Watcher(paths, name, Docker(), config)
+    watcher = Watcher(paths, name, Docker(), config_mod.load(paths, os.environ))
+    config = watcher.config
     limit = f"{config.launcher.idle_stop // 60} min" if config.launcher.idle_stop else "off"
     log(f"watching {name}: notify {config.launcher.notify}, idle stop {limit}")
     try:

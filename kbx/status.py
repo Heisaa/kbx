@@ -37,6 +37,7 @@ SLOW_INTERVAL = 10.0  # sessions (one exec per sandbox) and docker stats
 DETAIL_INTERVAL = 15.0  # health, git and agents of the selected sandbox
 IMAGE_INTERVAL = 60.0  # image id and drift
 RECENT_COMMITS = 5
+PROJECT_DEPTH = 2  # how deep in a profile's roots the dashboard looks for projects
 NPM = "https://registry.npmjs.org"
 # The native installers have no version endpoint; npm publishes the same versions.
 NPM_PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex", "pi": agents.PI_PACKAGE}
@@ -66,12 +67,22 @@ class Row:
     activity: tuple[str, ...] = ()  # per session: working, waiting, done, or ""
     cpu: str = ""
     memory: str = ""
-    orphan: bool = False  # the project directory is gone
+    orphan: bool = False  # the project directory (every root of a profile) is gone
+    profile: str = ""  # a profile sandbox; project_dir is then its first existing root
+    roots: tuple[Path, ...] = ()  # a profile's mounted roots
 
     @property
     def sandbox(self) -> Sandbox:
+        if self.profile:
+            return Sandbox(self.name, sandbox_mod.sanitize(self.project_dir.name), self.project_dir, "mount",
+                           self.profile, self.roots)  # fmt: skip
         sb = sandbox_mod.for_project(self.project_dir, self.mode)
         return sb if sb.name == self.name else replace(sb, name=self.name)
+
+    @property
+    def env(self) -> dict[str, str]:
+        """For commands run on this row: a profile's are pinned to it."""
+        return {"KBX_PROFILE": self.profile} if self.profile else {}
 
     @property
     def running(self) -> bool:
@@ -117,7 +128,7 @@ class Snapshot:
 
 
 def guard_state(paths: Paths, config: Config, name: str, state: str, mode: str) -> str:
-    if guard.Guard(paths, name).alert_file.exists():
+    if guard.alerted(paths, name):
         return "alert"  # also after the sandbox stopped: the seal found something
     if mode != "mount":
         return "-"
@@ -143,16 +154,26 @@ def list_rows(docker: Docker, paths: Paths, config: Config) -> list[Row]:
         started = state_part.get("StartedAt") if isinstance(state_part, dict) else None
         mode = str(labels.get(LABEL_WORKSPACE) or "clone")  # pyright: ignore[reportUnknownMemberType]
         project = entry["project"]
+        roots = sandbox_mod.mounted_roots({str(k): str(v) for k, v in labels.items()})  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
+        if entry["profile"]:
+            existing = [root for root in roots if root.is_dir()]
+            home_dir = (existing or list(roots) or [Path("/")])[0]
+            orphan = not existing
+        else:
+            home_dir = Path(project) if project else Path("/")
+            orphan = not project or not Path(project).is_dir()
         rows.append(
             Row(
                 name=entry["name"],
-                project_dir=Path(project) if project else Path("/"),
+                project_dir=home_dir,
                 state=entry["state"],
                 mode=mode,
                 started_at=str(started or ""),  # pyright: ignore[reportUnknownArgumentType]
                 image_id=str(data.get("Image") or ""),
                 guard=guard_state(paths, config, entry["name"], entry["state"], mode),
-                orphan=not project or not Path(project).is_dir(),
+                orphan=orphan,
+                profile=entry["profile"],
+                roots=roots,
             )
         )
     return sorted(rows, key=lambda row: (str(row.project_dir), row.name))
@@ -178,6 +199,17 @@ def stats(docker: Docker, names: Sequence[str]) -> dict[str, tuple[str, str]]:
 def stale(row: Row, config: Config, image_id: str) -> list[str]:
     """Why this sandbox differs from what a fresh one would be."""
     notes: list[str] = []
+    if row.profile:
+        profile = config.profiles.get(row.profile)
+        if row.orphan:
+            notes.append(f"every root of profile {row.profile} is gone")
+        if profile is None:
+            notes.append(f"profile {row.profile} is no longer in config.toml")
+        elif set(profile.roots) != set(row.roots):
+            notes.append(f"profile {row.profile}'s roots changed in config.toml; `kbx recreate` mounts them")
+        if image_id and row.image_id and row.image_id != image_id:
+            notes.append("created from an older image than the current one; `kbx recreate` uses the new one")
+        return notes
     if row.orphan:
         notes.append(f"its project directory {row.project_dir} is gone")
     if row.mode != config.workspace.mode:
@@ -207,6 +239,44 @@ def git_since(started_at: str) -> str | None:
     except ValueError:
         return None
     return moment.strftime("%Y-%m-%d %H:%M:%S +0000")
+
+
+def profile_projects(roots: Sequence[Path], depth: int = PROJECT_DEPTH) -> dict[str, Path]:
+    """Repositories near the top of a profile's roots, by their session slug.
+    Only names are read (no git runs on the host)."""
+    found: dict[str, Path] = {}
+    pending = [(root, 0) for root in roots]
+    while pending:
+        current, level = pending.pop()
+        if (current / ".git").exists() or (current / ".git").is_symlink():
+            found[sandbox_mod.project_slug(current)] = current
+            continue
+        if level >= depth:
+            continue
+        try:
+            children = sorted(entry for entry in current.iterdir() if entry.is_dir() and not entry.is_symlink())
+        except OSError:
+            continue
+        pending += [(child, level + 1) for child in children if not child.name.startswith(".")]
+    return found
+
+
+def profile_git(docker: Docker, sb: Sandbox, started_at: str, live: Sequence[str]) -> list[str]:
+    """A profile: the git state of each project with a session."""
+    projects = profile_projects(sb.roots)
+    slugs = sorted({key.partition("@")[2] for key in live if "@" in key})
+    if not slugs:
+        return ["no agent sessions; projects with one show their git state here"]
+    lines: list[str] = []
+    for slug in slugs:
+        path = projects.get(slug)
+        names = ", ".join(sandbox_mod.session_agent(key) for key in live if key.partition("@")[2] == slug)
+        if path is None:
+            lines.append(f"{sandbox_mod.slug_name(slug)} ({names}): deeper in the roots than the dashboard looks")
+            continue
+        lines.append(f"{path} ({names})")
+        lines += [f"  {line}" for line in mount_git(docker, replace(sb, project_dir=path), started_at)]
+    return lines
 
 
 def mount_git(docker: Docker, sb: Sandbox, started_at: str) -> list[str]:
@@ -289,7 +359,10 @@ def collect_details(docker: Docker, row: Row) -> Details:
             return None
 
     details.health = attempt("health", lambda: health(docker, sb))
-    if sb.mode == "mount":
+    if sb.profile:
+        live = sandbox_mod.sessions(docker, sb.name)
+        details.git = attempt("git", lambda: profile_git(docker, sb, row.started_at, live)) or []
+    elif sb.mode == "mount":
         details.git = attempt("git", lambda: mount_git(docker, sb, row.started_at)) or []
     else:
         details.git = attempt("git", lambda: clone_git(docker, sb)) or []

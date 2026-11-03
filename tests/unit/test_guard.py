@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -266,3 +267,102 @@ class WorktreeGuardTest(TempHome):
         self.assertEqual([a["path"] for a in self.check()], [".git"])
         self.assertEqual((self.repo / ".git").read_text(), original)
         run_git(self.repo, "status")
+
+
+class ProfileRootTest(TempHome):
+    """A profile root that is not a repository: every project in it is guarded."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = self.temp / "work"
+        self.api = self.make_repo("work/api")
+        self.web = self.make_repo("work/team/web")  # deeper down
+        self.paths = paths.resolve({"HOME": str(self.home)})
+        other = self.temp / "other"
+        other.mkdir()
+        self.other = other
+        self.sb = sandbox.for_profile("work", (self.root, other), self.api)
+        self.guard = guard.Guard(self.paths, self.sb.name, self.root)
+
+    def check(self, walk: bool = True) -> list[dict[str, Any]]:
+        with self.guard.lock():
+            state = self.guard.load_state()
+            assert state is not None
+            return self.guard.check_locked(state, walk=walk)
+
+    def start(self) -> None:
+        guard.before_start(self.paths, self.sb, list(PROTECT))
+
+    def test_each_root_has_its_own_baseline(self) -> None:
+        self.start()
+        states = [g.load_state() for g in guard.recorded(self.paths, self.sb.name)]
+        self.assertEqual(sorted(str(s["root"]) for s in states if s), sorted([str(self.root), str(self.other)]))
+        state = self.guard.load_state()
+        assert state is not None
+        self.assertFalse(state["repo"])
+        self.assertEqual(sorted(state["repos"]), ["api", "team/web"])
+        self.assertFalse((self.paths.guard_dir / self.sb.name / "state.json").exists())
+
+    def test_every_project_is_checked(self) -> None:
+        self.start()
+        (self.web / ".git" / "hooks" / "pre-commit").write_text("evil\n")
+        run_git(self.api, "config", "core.fsmonitor", "evil")
+        (self.api / ".husky").mkdir()
+        (self.api / ".husky" / "pre-commit").write_text("evil\n")
+        actions = self.check()
+        self.assertEqual(
+            sorted(a["path"] for a in actions),
+            ["api/.git/config", "api/.husky/pre-commit", "team/web/.git/hooks/pre-commit"],
+        )
+        self.assertFalse((self.web / ".git" / "hooks" / "pre-commit").exists())
+        self.assertNotIn("fsmonitor", run_git(self.api, "config", "--list"))
+        report = "\n".join(guard.report(self.paths, self.sb))
+        self.assertIn(f"The kbx guard stopped these changes in {self.root}:", report)
+        self.assertTrue(guard.alerted(self.paths, self.sb.name))
+        with self.assertRaises(KbxError):
+            self.start()
+        guard.resolve(self.paths, self.sb, list(PROTECT), accept=False)
+        self.assertFalse(guard.alerted(self.paths, self.sb.name))
+        self.start()
+
+    def test_safe_work_and_a_removed_project_pass(self) -> None:
+        (self.api / ".vscode").mkdir()
+        (self.api / ".vscode" / "settings.json").write_text("{}\n")
+        self.start()
+        (self.api / "a.txt").write_text("a")
+        run_git(self.api, "add", "a.txt")
+        run_git(self.api, "commit", "-q", "-m", "a")
+        subprocess.run(["rm", "-rf", str(self.api)], check=True)  # the user removes a project
+        self.assertEqual(self.check(), [])
+
+    def test_a_project_git_pointing_elsewhere_is_moved_away(self) -> None:
+        self.start()
+        evil = self.temp / "evilgit"
+        os.rename(self.web / ".git", evil)
+        (self.web / ".git").write_text(f"gitdir: {evil}\n")
+        actions = self.check()
+        self.assertEqual([(a["path"], a["kind"]) for a in actions], [("team/web/.git", "gitfile")])
+        self.assertFalse((self.web / ".git").exists())
+        notes = guard.resolve(self.paths, self.sb, list(PROTECT), accept=True)
+        self.assertEqual(notes, ["restored team/web/.git (the agent's version)"])
+        self.assertEqual((self.web / ".git").read_text(), f"gitdir: {evil}\n")
+
+    def test_a_new_project_is_found_at_once(self) -> None:
+        self.start()
+        self.assertEqual(self.check(walk=False), [])
+        fresh = self.make_repo("work/fresh")
+        (fresh / ".git" / "hooks" / "post-checkout").write_text("evil\n")
+        actions = self.check(walk=False)  # a new directory in the root: no wait for the walk
+        self.assertEqual([a["path"] for a in actions], ["fresh/.git/hooks/post-checkout"])
+
+    def test_dependency_directories_are_not_walked(self) -> None:
+        (self.api / "node_modules" / "dep").mkdir(parents=True)
+        run_git(self.api / "node_modules" / "dep", "init", "-q")
+        self.assertEqual([base for base, _ in guard.find_repos(self.root)], [self.api, self.web])
+
+    def test_roots_no_longer_mounted_are_forgotten(self) -> None:
+        self.start()
+        narrower = sandbox.for_profile("work", (self.root,), self.api)
+        guard.before_start(self.paths, narrower, list(PROTECT))
+        roots = [str((g.load_state() or {}).get("root")) for g in guard.recorded(self.paths, self.sb.name)]
+        self.assertEqual(roots, [str(self.root)])

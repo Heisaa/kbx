@@ -274,7 +274,8 @@ def main() -> int:
                 continue
             labels = container["Config"]["Labels"]
             if "kbx.name" in labels:
-                print(f"{name}\t{container['State']['Status']}\t{labels.get('kbx.project', '')}")
+                status = container["State"]["Status"]
+                print(f"{name}\t{status}\t{labels.get('kbx.project', '')}\t{labels.get('kbx.profile', '')}")
         return 0
     if command == "info":
         print("runc")

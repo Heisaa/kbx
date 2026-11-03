@@ -105,6 +105,13 @@ def short_path(path: Path, home: Path) -> str:
         return str(path)
 
 
+def where(row: Row, home: Path) -> str:
+    """What a row is about: its project, or its profile and roots."""
+    if row.profile:
+        return f"[{row.profile}] " + ", ".join(short_path(root, home) for root in row.roots)
+    return short_path(row.project_dir, home)
+
+
 def ago(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
@@ -176,9 +183,10 @@ def cells(row: Row, config: Config, snap: Snapshot, home: Path) -> dict[str, str
         live = "…" if row.running else "-"
     else:
         marks = dict(zip(row.sessions, row.activity, strict=False))
-        live = ",".join(f"{name}:{marks[name]}" if marks.get(name) else name for name in row.sessions) or "-"
+        labels = {name: sandbox_mod.session_label(name) for name in row.sessions}
+        live = ",".join(f"{labels[n]}:{marks[n]}" if marks.get(n) else labels[n] for n in row.sessions) or "-"
     return {
-        "PROJECT": clean(short_path(row.project_dir, home)),
+        "PROJECT": clean(where(row, home)),
         "STATE": clean(row.state),
         "MODE": clean(row.mode),
         "GUARD": GUARD_LABELS.get(row.guard, (clean(row.guard), "normal"))[0],
@@ -297,6 +305,8 @@ def guard_section(row: Row, snap: Snapshot) -> list[Line]:
         lines.append(("  ✗ No guard is watching this running sandbox.", "alert"))
         lines.append(("    The agent could plant git hooks or config that your git would run.", "alert"))
         lines.append(("    S (kbx start) checks the checkout and starts the guard.", "bold"))
+    elif row.guard == "watching" and row.profile:
+        lines.append(("  ✓ watching every project's git hooks, config and protected files in the roots", "ok"))
     elif row.guard == "watching":
         lines.append(("  ✓ watching the checkout's git hooks, config and protected files", "ok"))
     elif row.guard == "off":
@@ -385,14 +395,18 @@ def staleness_section(row: Row, config: Config, snap: Snapshot) -> list[Line]:
 
 def detail_lines(row: Row, snap: Snapshot, config: Config, home: Path) -> list[Line]:
     details = snap.details.get(row.name)
-    title = f"{row.name} · {short_path(row.project_dir, home)} · {row.mode} mode · {row.state}"
+    title = f"{row.name} · {where(row, home)} · {row.mode} mode · {row.state}"
     if details is not None and row.running:
         title += f" · details {ago(max(0.0, time.time() - details.at))} old"
     if row.name in snap.busy:
         title += " · refreshing…"
     lines: list[Line] = [(clean(title), "bold")]
     if row.orphan:
-        lines.append(("  ⚠ The project directory is gone: only t (stop) and D (remove) work here.", "warn"))
+        gone = "Every root of the profile is" if row.profile else "The project directory is"
+        lines.append((f"  ⚠ {gone} gone: only t (stop) and D (remove) work here.", "warn"))
+    elif row.profile:
+        note = f"  Commands run in {short_path(row.project_dir, home)} with KBX_PROFILE={row.profile}; "
+        lines.append((note + "an agent started here works there. Start one in a project from its directory.", "dim"))
     lines += guard_section(row, snap)
     lines += health_section(row, details)
     lines += git_section(row, details)
@@ -668,7 +682,7 @@ class App:
             self.monitor.check_latest()
             return
         if char == "b":
-            self.run(Action(("build",)), self.home, None)
+            self.run(Action(("build",)), self.home, None, {})
             return
         if row is None:
             return
@@ -677,7 +691,7 @@ class App:
             return
         action = self.action(char, row)
         if action is not None:
-            self.run(action, row.project_dir, row.name)
+            self.run(action, row.project_dir, row.name, row.env)
 
     def navigate(self, key: int, snap: Snapshot) -> bool:
         """Selection and scrolling. In full-screen details ↑↓ scroll (a phone's
@@ -723,6 +737,14 @@ class App:
         live = list(row.sessions or ())
         if row.running and len(live) == 1:
             return Action(("attach", live[0]), interactive=True)
+        if row.profile and len(live) > 1:
+            # Sessions of several projects: pick one by number.
+            shown = live[:9]
+            listed = " ".join(f"[{n}] {sandbox_mod.session_label(k)}" for n, k in enumerate(shown, 1))
+            choice = self.ask(f"Attach to which? {listed} ")
+            if choice.isdigit() and 1 <= int(choice) <= len(shown):
+                return Action(("attach", shown[int(choice) - 1]), interactive=True)
+            return None
         which = "Attach to which agent?" if live else "No agent is running. Start which?"
         choice = self.ask(f"{which} [c]laude [x]codex [p]i ")
         name = {"c": "claude", "x": "codex", "p": "pi"}.get(choice)
@@ -754,7 +776,7 @@ class App:
 
     # --- running commands ---
 
-    def run(self, action: Action, cwd: Path, name: str | None) -> None:
+    def run(self, action: Action, cwd: Path, name: str | None, env: dict[str, str]) -> None:
         if action.confirm and not self.confirm(action.confirm):
             return
         self.monitor.pause()
@@ -765,7 +787,7 @@ class App:
         # reset to the default in the child at exec.
         previous = {sig: signal.signal(sig, _noop) for sig in (signal.SIGINT, signal.SIGQUIT)}
         try:
-            code = run_command(self.entry, action.args, cwd)
+            code = run_command(self.entry, action.args, cwd, env)
             if not action.interactive or code != 0:
                 print(f"\n[kbx {' '.join(action.args)}: exit {code}] Press Enter to return to the dashboard.")
                 try:
@@ -786,10 +808,12 @@ class App:
             self.monitor.resume(name)
 
 
-def run_command(entry: Path, args: Sequence[str], cwd: Path) -> int:
-    print(f"$ kbx {' '.join(args)}    (in {cwd})", flush=True)
+def run_command(entry: Path, args: Sequence[str], cwd: Path, env: dict[str, str] | None = None) -> int:
+    prefix = "".join(f"{key}={value} " for key, value in (env or {}).items())
+    print(f"$ {prefix}kbx {' '.join(args)}    (in {cwd})", flush=True)
     try:
-        return subprocess.run([sys.executable, str(entry), *args], cwd=str(cwd), check=False).returncode
+        full = {**os.environ, **(env or {})}
+        return subprocess.run([sys.executable, str(entry), *args], cwd=str(cwd), env=full, check=False).returncode
     except OSError as exc:
         print(f"kbx: cannot run the command: {exc}", file=sys.stderr)
         return 1

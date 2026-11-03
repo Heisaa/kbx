@@ -22,6 +22,16 @@ user changed while the sandbox was stopped is trusted. A guard process runs
 while the sandbox does (`kbx _guard NAME`, spawned by the launcher); when the
 sandbox stops it checks once more and seals the state. Without a seal (the
 guard died, the host rebooted), the next start checks before it trusts.
+
+A profile sandbox mounts several roots, each with a baseline of its own (under
+`roots/<hash>/` of the sandbox's guard directory); one guard process watches
+them all, and a finding in any pauses the whole sandbox. A root that is not a
+repository itself holds projects: every repository found in it gets the checks
+a checkout gets (its hooks path and `protect` paths, relative to it), and a
+repository whose `.git` turns into a pointer elsewhere is a finding. A project
+that disappears with its `.git` (the user removed it) is not. Repositories that
+appear later are found by the walk: at once for a new directory directly in
+the root, within WALK_INTERVAL deeper down.
 """
 
 from __future__ import annotations
@@ -113,6 +123,20 @@ SAFE_SUB: dict[str, frozenset[str] | None] = {
 }
 
 _INOTIFY_MASK = 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800
+
+# Dependency and cache directories the walk for nested repositories skips: huge,
+# rebuilt by tools, and not where anyone runs git. Each applies only beside the
+# file that marks its tool, where there is one.
+SKIP_DIRS: dict[str, tuple[str, ...]] = {
+    "node_modules": (),
+    "__pycache__": (),
+    ".tox": (),
+    ".nox": (),
+    ".mypy_cache": (),
+    ".pytest_cache": (),
+    ".ruff_cache": (),
+    "target": ("Cargo.toml",),
+}
 
 
 def _now() -> str:
@@ -281,6 +305,7 @@ class Snapshot:
     configs: list[str] = field(default_factory=list[str])  # kept as trusted copies, not hashed
     problems: list[Finding] = field(default_factory=list[Finding])
     watch: set[str] = field(default_factory=set[str])
+    gone: list[str] = field(default_factory=list[str])  # labels of projects removed with their .git
 
 
 def _expand(gitdir: Path) -> Iterator[GitDir]:
@@ -306,34 +331,82 @@ def _expand(gitdir: Path) -> Iterator[GitDir]:
                     pending.append(entry)
 
 
-def nested_gitdirs(root: Path) -> list[Path]:
-    """Repositories inside the tree (not the checkout's own): editors run git in them too."""
-    found: list[Path] = []
+def _skipped(base: Path, name: str, files: Sequence[str]) -> bool:
+    if name == ".git":
+        return True
+    if name in (".venv", "venv"):
+        return (base / name / "pyvenv.cfg").is_file()
+    markers = SKIP_DIRS.get(name)
+    return markers is not None and (not markers or any(marker in files for marker in markers))
+
+
+def find_repos(root: Path) -> list[tuple[Path, Path]]:
+    """Every repository in the tree: (its working directory, its git directory),
+    the root's own included. A `.git` that leads outside the tree is left out."""
+    found: list[tuple[Path, Path]] = []
     for current, dirs, files in os.walk(root):
         base = Path(current)
         if ".git" in dirs or ".git" in files:
             entry = base / ".git"
-            if base != root:
-                target = entry
-                if entry.is_symlink():
-                    target = Path(os.path.realpath(entry))
-                elif entry.is_file():
-                    target = _read_gitfile(entry) or entry
-                if target.is_dir() and _inside(root, target):
-                    found.append(target)
-        dirs[:] = [d for d in dirs if d != ".git"]
+            target = entry
+            if entry.is_symlink():
+                target = Path(os.path.realpath(entry))
+            elif entry.is_file():
+                target = _read_gitfile(entry) or entry
+            if target.is_dir() and _inside(root, target):
+                found.append((base, target))
+        dirs[:] = sorted(d for d in dirs if not _skipped(base, d, files))
     return found
 
 
-class Guard:
-    """State, checks and actions for one sandbox's checkout. Methods ending in
-    `_locked` expect the caller to hold `lock()`."""
+def nested_gitdirs(root: Path) -> list[Path]:
+    """Repositories inside the tree (not the checkout's own): editors run git in them too."""
+    return [gitdir for base, gitdir in find_repos(root) if base != root]
 
-    def __init__(self, paths: Paths, name: str) -> None:
+
+def _top_level(repos: Sequence[tuple[Path, Path]]) -> list[tuple[Path, Path]]:
+    """The projects of a root that is not a repository: repositories not inside another's tree."""
+    bases = {base for base, _ in repos}
+    return [(base, gitdir) for base, gitdir in repos if not any(p in bases for p in base.parents)]
+
+
+def _common(gitdir: Path) -> Path:
+    """A git directory's common directory (itself, unless it is a linked worktree's)."""
+    commondir = gitdir / "commondir"
+    if commondir.is_file() and not commondir.is_symlink():
+        text = commondir.read_text(errors="replace").strip()
+        if text:
+            return Path(os.path.normpath(gitdir / text))
+    return gitdir
+
+
+def _repo_layout(base: Path) -> dict[str, str] | None:
+    """How a project's `.git` looks: a directory, or a file pointing to one."""
+    entry = base / ".git"
+    if entry.is_symlink():
+        return None
+    if entry.is_dir():
+        return {"kind": "dir"}
+    target = _read_gitfile(entry) if entry.is_file() else None
+    return {"kind": "file", "target": os.path.realpath(target)} if target else None
+
+
+def _root_key(root: Path) -> str:
+    return hashlib.sha256(str(root).encode()).hexdigest()[:12]
+
+
+class Guard:
+    """State, checks and actions for one sandbox's checkout, or one root of a
+    profile sandbox (`root`). Methods ending in `_locked` expect the caller to
+    hold `lock()`."""
+
+    def __init__(self, paths: Paths, name: str, root: Path | None = None) -> None:
         self.paths = paths
         self.name = name
-        self.dir = paths.guard_dir / name
+        self.dir = paths.guard_dir / name if root is None else paths.guard_dir / name / "roots" / _root_key(root)
         self.nested: list[Path] = []
+        self.projects: list[tuple[Path, Path]] = []  # a root that is not a repository: its repositories
+        self._heads: set[str] = set()  # those directly in the root, to notice a new one at once
         self.watch: set[str] = set()  # directories the last snapshot looked at
         self._walked = False
         self._global_hooks: str | None = None
@@ -355,8 +428,11 @@ class Guard:
         return self.dir / "trusted"
 
     @contextlib.contextmanager
-    def lock(self) -> Generator[None]:
-        self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    def lock(self, create: bool = True) -> Generator[None]:
+        """Without `create`, a removed state directory (`kbx rm`) stays removed:
+        FileNotFoundError instead."""
+        if create:
+            self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         with open(self.dir / "lock", "w") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             yield
@@ -380,33 +456,54 @@ class Guard:
 
     # --- scanning ---
 
-    def snapshot(self, root: Path, protect: Sequence[str], walk: bool, layout: tuple[Path, Path]) -> Snapshot:
+    def snapshot(
+        self,
+        root: Path,
+        protect: Sequence[str],
+        walk: bool,
+        layout: tuple[Path, Path] | None,
+        repos: dict[str, dict[str, str]] | None = None,
+    ) -> Snapshot:
         """`layout`: the checkout's git directory and the repository's common
-        directory, as trusted at the baseline (see sandbox.git_dirs)."""
+        directory, as trusted at the baseline (see sandbox.git_dirs); None for a
+        profile root that is not a repository, whose projects' `.git` layouts at
+        the baseline are `repos`."""
         snap = Snapshot()
         snap.watch.add(str(root))
-        gitdir, common = layout
-        entry = root / ".git"
-        if gitdir == entry:
-            if entry.is_symlink() or not entry.is_dir():
-                snap.problems.append(Finding(".git", "gitdir", "is no longer the repository directory"))
-                return snap
+        if layout is None:
+            self._check_repos(root, repos or {}, snap)
+            heads = (
+                {e.name for e in os.scandir(root) if os.path.lexists(Path(e.path) / ".git")} if root.is_dir() else set()
+            )
+            walk = walk or heads != self._heads
+            self._heads = heads
         else:
-            # A linked worktree: `.git` is a file naming its git directory.
-            target = _read_gitfile(entry) if entry.is_file() and not entry.is_symlink() else None
-            if target is None or os.path.realpath(target) != os.path.realpath(gitdir):
-                snap.problems.append(Finding(".git", "gitfile", "points git to another directory"))
+            gitdir, common = layout
+            entry = root / ".git"
+            if gitdir == entry:
+                if entry.is_symlink() or not entry.is_dir():
+                    snap.problems.append(Finding(".git", "gitdir", "is no longer the repository directory"))
+                    return snap
             else:
-                snap.configs.append(".git")
-            if not common.is_dir():
-                snap.problems.append(Finding(_label(root, common), "gitdir", "is no longer the repository directory"))
-                return snap
+                # A linked worktree: `.git` is a file naming its git directory.
+                target = _read_gitfile(entry) if entry.is_file() and not entry.is_symlink() else None
+                if target is None or os.path.realpath(target) != os.path.realpath(gitdir):
+                    snap.problems.append(Finding(".git", "gitfile", "points git to another directory"))
+                else:
+                    snap.configs.append(".git")
+                if not common.is_dir():
+                    snap.problems.append(
+                        Finding(_label(root, common), "gitdir", "is no longer the repository directory")
+                    )
+                    return snap
         if walk or not self._walked:
-            self.nested = nested_gitdirs(root)
+            found = find_repos(root) if root.is_dir() else []
+            self.nested = [gitdir for base, gitdir in found if base != root]
+            self.projects = _top_level(found) if layout is None else []
             self._global_hooks = global_hooks_path()
             self._walked = True
         seen: set[str] = set()
-        for top in [common, *self.nested]:
+        for top in self.nested if layout is None else [layout[1], *self.nested]:
             if not top.is_dir():
                 continue
             for repo in _expand(top):
@@ -415,16 +512,32 @@ class Guard:
                     continue
                 seen.add(real)
                 self._scan_gitdir(root, repo, snap)
-        hooks_path = self._hooks_path(root, _label(root, common / "config"), snap)
-        if hooks_path is not None:
-            self._scan_tree(root, hooks_path, snap)
-        for rel in protect:
-            self._scan_tree(root, root / rel, snap)
+        checkouts = [(root, layout[1])] if layout is not None else self.projects
+        for checkout, gitdir in checkouts:
+            common = layout[1] if layout is not None else _common(gitdir)
+            hooks_path = self._hooks_path(checkout, _label(root, common / "config"), snap)
+            if hooks_path is not None:
+                self._scan_tree(root, hooks_path, snap)
+            for rel in protect:
+                self._scan_tree(root, checkout / rel, snap)
         self.watch = snap.watch
         return snap
 
-    def _hooks_path(self, root: Path, config: str, snap: Snapshot) -> Path | None:
-        """The in-tree hooks directory, if core.hooksPath points into the project.
+    def _check_repos(self, root: Path, repos: dict[str, dict[str, str]], snap: Snapshot) -> None:
+        """A profile root: each repository's `.git` as at the baseline. Gone with
+        it (the project was removed) is fine; pointing elsewhere is not."""
+        for label, before in sorted(repos.items()):
+            base = root / label if label != "." else root
+            entry = base / ".git"
+            if not os.path.lexists(entry):
+                snap.gone.append(label)
+                continue
+            if _repo_layout(base) != before:
+                rel = ".git" if label == "." else f"{label}/.git"
+                snap.problems.append(Finding(rel, "gitfile", "now points git to another directory"))
+
+    def _hooks_path(self, checkout: Path, config: str, snap: Snapshot) -> Path | None:
+        """The in-tree hooks directory, if core.hooksPath points into the checkout.
         A relative path is relative to the checkout git runs in."""
         value = self._global_hooks
         for entry in snap.flagged.get(config, []):  # core.hookspath is never a safe key
@@ -434,8 +547,8 @@ class Guard:
         if not value:
             return None
         path = Path(os.path.expanduser(value))
-        path = Path(os.path.normpath(path if path.is_absolute() else root / path))
-        return path if _inside(root, path) and path != root else None
+        path = Path(os.path.normpath(path if path.is_absolute() else checkout / path))
+        return path if _inside(checkout, path) and path != checkout else None
 
     def _scan_gitdir(self, root: Path, gitdir: GitDir, snap: Snapshot) -> None:
         path = gitdir.path
@@ -529,14 +642,25 @@ class Guard:
             before, after = base_files.get(rel), snap.files.get(rel)
             if before == after:
                 continue
+            if after is None and any(rel.startswith(f"{label}/") for label in snap.gone if label != "."):
+                continue  # its project was removed
             what = "added" if before is None else "removed" if after is None else "changed"
             findings.append(Finding(rel, "file", what))
         return findings
 
     def trust_locked(self, root: Path, protect: Sequence[str], *, sealed: bool = False) -> Snapshot:
-        """Take the current state as the baseline, with copies to restore from."""
-        gitdir, common = git_dirs(root)
-        snap = self.snapshot(root, protect, walk=True, layout=(gitdir, common))
+        """Take the current state as the baseline, with copies to restore from.
+        A profile root need not be a repository (then `repo` is false)."""
+        repo = os.path.lexists(root / ".git")
+        layout = git_dirs(root) if repo else None
+        snap = self.snapshot(root, protect, walk=True, layout=layout)
+        gitdir, common = layout or (None, None)
+        repos: dict[str, dict[str, str]] = {}
+        if not repo:
+            for base, _ in find_repos(root) if root.is_dir() else []:
+                found = _repo_layout(base)
+                if found is not None:
+                    repos[_label(root, base)] = found
         shutil.rmtree(self.trusted, ignore_errors=True)
         self.trusted.mkdir(parents=True, mode=0o700)
         self._kept.clear()
@@ -546,8 +670,10 @@ class Guard:
             {
                 "version": STATE_VERSION,
                 "root": str(root),
-                "gitdir": str(gitdir),
-                "common": str(common),
+                "repo": repo,
+                "gitdir": str(gitdir) if gitdir else "",
+                "common": str(common) if common else "",
+                "repos": repos,
                 "protect": list(protect),
                 "flagged": snap.flagged,
                 "files": {rel: digest for rel, digest in snap.files.items()},
@@ -575,7 +701,7 @@ class Guard:
         root = Path(state["root"])
         if not root.is_dir():
             return []
-        snap = self.snapshot(root, state.get("protect", []), walk, _layout(state))
+        snap = self.snapshot(root, state.get("protect", []), walk, _layout(state), state.get("repos"))
         findings = self.compare(state, snap)
         if not findings:
             for rel in snap.configs:  # the user's own safe edits become the version to restore
@@ -583,9 +709,8 @@ class Guard:
             return []
         quarantine = self.dir / "quarantine" / f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1000000:06d}"
         actions = [self._neutralize(root, state, finding, quarantine) for finding in findings]
-        left = {
-            f.path for f in self.compare(state, self.snapshot(root, state.get("protect", []), False, _layout(state)))
-        }
+        again = self.snapshot(root, state.get("protect", []), False, _layout(state), state.get("repos"))
+        left = {f.path for f in self.compare(state, again)}
         for action in actions:
             if action["path"] in left and "by hand" not in action["action"]:
                 action["action"] += "; still there, fix it by hand"
@@ -602,6 +727,11 @@ class Guard:
                 shutil.copy2(path, saved)
                 self._reset_keys(path, finding, state.get("flagged", {}).get(finding.path, []))
                 action.update(action="removed the new settings", quarantine=str(saved))
+            elif finding.kind == "gitfile" and finding.path != ".git":
+                # A project's .git now leads elsewhere; its own directory is gone.
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(path), str(saved))
+                action.update(action="moved it away, so git no longer runs there", quarantine=str(saved))
             elif finding.kind in ("file", "symlink", "unreadable", "commondir", "gitfile"):
                 if path.is_symlink() or path.exists():
                     saved.parent.mkdir(parents=True, exist_ok=True)
@@ -674,20 +804,23 @@ class Guard:
 
     def seal(self) -> list[dict[str, str]]:
         """After the sandbox stopped: a last check, then mark the state clean."""
-        if not self.dir.is_dir():
+        try:
+            with self.lock(create=False):
+                state = self.load_state()
+                if state is None:
+                    return []
+                actions = self.check_locked(state, walk=True)
+                if not actions:
+                    state["sealed"] = True
+                    self.save_state(state)
+                return actions
+        except FileNotFoundError:
             return []  # removed with the sandbox (`kbx rm`)
-        with self.lock():
-            state = self.load_state()
-            if state is None:
-                return []
-            actions = self.check_locked(state, walk=True)
-            if not actions:
-                state["sealed"] = True
-                self.save_state(state)
-            return actions
 
 
-def _layout(state: dict[str, Any]) -> tuple[Path, Path]:
+def _layout(state: dict[str, Any]) -> tuple[Path, Path] | None:
+    if state.get("repo") is False:
+        return None
     root = Path(state["root"])
     return Path(state.get("gitdir") or root / ".git"), Path(state.get("common") or root / ".git")
 
@@ -708,26 +841,70 @@ def summary(actions: Sequence[dict[str, str]]) -> str:
 # --- launcher entry points ---
 
 
-def _alert_error(sandbox: Sandbox, actions: Sequence[dict[str, str]]) -> KbxError:
+def _alert_error(root: Path, actions: Sequence[dict[str, str]]) -> KbxError:
     return KbxError(
-        f"the kbx guard found changes host tools would run in {sandbox.project_dir}: {summary(actions)}. "
+        f"the kbx guard found changes host tools would run in {root}: {summary(actions)}. "
         "They are neutralized; `kbx resume` shows the details"
     )
 
 
+def guards(paths: Paths, sandbox: Sandbox) -> list[tuple[Path, Guard]]:
+    """Each mounted root and its guard: the checkout of a project sandbox, every
+    root of a profile sandbox (`sandbox.roots` must be what the container mounts)."""
+    if not sandbox.profile:
+        return [(sandbox.project_dir, Guard(paths, sandbox.name))]
+    return [(root, Guard(paths, sandbox.name, root)) for root in sandbox.roots]
+
+
+def recorded(paths: Paths, name: str) -> list[Guard]:
+    """Every guard with state on disk for this sandbox (for the guard process and
+    the watcher, which know only its name)."""
+    found = [Guard(paths, name)]
+    roots = paths.guard_dir / name / "roots"
+    if roots.is_dir():
+        for entry in sorted(roots.iterdir()):
+            guard = Guard(paths, name)
+            guard.dir = entry
+            found.append(guard)
+    return [guard for guard in found if guard.state_file.exists() or guard.alert_file.exists()]
+
+
+def alerted(paths: Paths, name: str) -> bool:
+    return any(guard.alert_file.exists() for guard in recorded(paths, name))
+
+
+def seal(paths: Paths, name: str) -> list[dict[str, str]]:
+    """After the sandbox stopped: a last check of every root, then seal each."""
+    return [action for guard in recorded(paths, name) for action in guard.seal()]
+
+
+def _forget_other_roots(paths: Paths, sandbox: Sandbox) -> None:
+    """A profile no longer mounts these roots: drop their baselines (alerts stay)."""
+    roots = paths.guard_dir / sandbox.name / "roots"
+    if not sandbox.profile or not roots.is_dir():
+        return
+    wanted = {_root_key(root) for root in sandbox.roots}
+    for entry in roots.iterdir():
+        if entry.name not in wanted and not (entry / "alert.json").exists():
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 def before_start(paths: Paths, sandbox: Sandbox, protect: Sequence[str]) -> None:
     """The sandbox is not running: check an unsealed state, then take the baseline."""
-    guard = Guard(paths, sandbox.name)
-    with guard.lock():
+    for guard in recorded(paths, sandbox.name):
         alert = guard.load_alert()
         if alert:
-            raise _alert_error(sandbox, alert["findings"])
-        state = guard.load_state()
-        if state is not None and not state.get("sealed") and Path(state["root"]) == sandbox.project_dir:
-            actions = guard.check_locked(state, walk=True)
-            if actions:
-                raise _alert_error(sandbox, actions)
-        guard.trust_locked(sandbox.project_dir, protect)
+            state = guard.load_state() or {}
+            raise _alert_error(Path(state.get("root") or sandbox.project_dir), alert["findings"])
+    _forget_other_roots(paths, sandbox)
+    for root, guard in guards(paths, sandbox):
+        with guard.lock():
+            state = guard.load_state()
+            if state is not None and not state.get("sealed") and Path(state["root"]) == root:
+                actions = guard.check_locked(state, walk=True)
+                if actions:
+                    raise _alert_error(root, actions)
+            guard.trust_locked(root, protect)
 
 
 def _pid_file(paths: Paths, name: str) -> Path:
@@ -743,28 +920,44 @@ def running(paths: Paths, name: str) -> bool:
     return b"_guard" in cmdline and name.encode() in cmdline
 
 
+@contextlib.contextmanager
+def _spawn_lock(paths: Paths, name: str) -> Generator[None]:
+    """One launcher at a time decides whether this sandbox needs a guard process."""
+    directory = paths.guard_dir / name
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(directory / "spawn.lock", "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
 def ensure(paths: Paths, sandbox: Sandbox, docker: Docker, entry: Path, protect: Sequence[str]) -> None:
     """The sandbox is running: make sure a guard watches it (checking first if none did)."""
-    guard = Guard(paths, sandbox.name)
-    with guard.lock():
-        if not running(paths, sandbox.name):
-            state = guard.load_state()
-            if state is None or Path(state["root"]) != sandbox.project_dir:
-                print(
-                    "⚠ the kbx guard has no baseline for this running sandbox; taking the current state",
-                    file=sys.stderr,
-                )
-                guard.trust_locked(sandbox.project_dir, protect)
-            else:
-                actions = guard.check_locked(state, walk=True)
-                if actions:
-                    pause(docker, sandbox)
-                state["sealed"] = False
-                guard.save_state(state)
-            spawn(paths, sandbox.name, entry)
+    with _spawn_lock(paths, sandbox.name):
+        _ensure_locked(paths, sandbox, docker, entry, protect)
+    for root, guard in guards(paths, sandbox):
         alert = guard.load_alert()
-    if alert:
-        raise _alert_error(sandbox, alert["findings"])
+        if alert:
+            raise _alert_error(root, alert["findings"])
+
+
+def _ensure_locked(paths: Paths, sandbox: Sandbox, docker: Docker, entry: Path, protect: Sequence[str]) -> None:
+    if not running(paths, sandbox.name):
+        for root, guard in guards(paths, sandbox):
+            with guard.lock():
+                state = guard.load_state()
+                if state is None or Path(state["root"]) != root:
+                    print(
+                        f"⚠ the kbx guard has no baseline for {root} in this running sandbox; taking the current state",
+                        file=sys.stderr,
+                    )
+                    guard.trust_locked(root, protect)
+                else:
+                    actions = guard.check_locked(state, walk=True)
+                    if actions:
+                        pause(docker, sandbox)
+                    state["sealed"] = False
+                    guard.save_state(state)
+        spawn(paths, sandbox.name, entry)
 
 
 def spawn(paths: Paths, name: str, entry: Path) -> None:
@@ -804,7 +997,7 @@ def _tell(guard: Guard, sandbox_root: str, actions: Sequence[dict[str, str]]) ->
         f"  The agent is frozen. Detach with Ctrl-P Ctrl-Q, then run `kbx resume` in {sandbox_root}.\r\n"
     )
     try:
-        ttys = (guard.dir / "ttys").read_text().split()
+        ttys = (guard.paths.guard_dir / guard.name / "ttys").read_text().split()
     except OSError:
         ttys = []
     for tty in ttys:
@@ -858,22 +1051,21 @@ class Inotify:
 
 
 def run(paths: Paths, name: str) -> int:
-    """`kbx _guard NAME`: watch until the sandbox stops, then seal."""
+    """`kbx _guard NAME`: watch every root until the sandbox stops, then seal."""
     global _verbose
     _verbose = True
-    guard = Guard(paths, name)
-    state = guard.load_state()
-    if state is None:
+    watched = [(guard, state) for guard in recorded(paths, name) if (state := guard.load_state()) is not None]
+    if not watched:
         log(f"guard {name}: no baseline; exiting")
         return 1
     docker = Docker()
-    sandbox = Sandbox(name=name, project=name, project_dir=Path(state["root"]), mode="mount")
+    sandbox = Sandbox(name=name, project=name, project_dir=Path(watched[0][1]["root"]), mode="mount")
     try:
         watcher: Inotify | None = Inotify()
     except (OSError, AttributeError) as exc:
         log(f"guard {name}: no inotify ({exc}); checking every {CHECK_INTERVAL:.0f}s")
         watcher = None
-    log(f"guard {name}: watching {state['root']}")
+    log(f"guard {name}: watching {', '.join(str(state['root']) for _, state in watched)}")
     status = "running"
     next_status = 0.0
     next_walk = time.monotonic() + WALK_INTERVAL
@@ -884,10 +1076,10 @@ def run(paths: Paths, name: str) -> int:
             status = str(((data or {}).get("State") or {}).get("Status", "gone"))
             next_status = now + STATUS_INTERVAL
             if status not in ("running", "paused", "restarting"):
-                actions = guard.seal()
+                actions = [action for guard, _ in watched for action in guard.seal()]
                 log(f"guard {name}: sandbox is {status}; " + ("sealed" if not actions else summary(actions)))
                 return 0
-        if not guard.dir.is_dir():
+        if not (paths.guard_dir / name).is_dir():
             log(f"guard {name}: state removed; exiting")
             return 0
         if status == "paused":
@@ -896,10 +1088,21 @@ def run(paths: Paths, name: str) -> int:
         walk = now >= next_walk
         if walk:
             next_walk = now + WALK_INTERVAL
-        with guard.lock():
-            state = guard.load_state() or state
-            actions = guard.check_locked(state, walk)
-        if actions:
+        found: tuple[Guard, dict[str, Any], list[dict[str, str]]] | None = None
+        try:
+            for index, (guard, last) in enumerate(watched):
+                with guard.lock(create=False):
+                    state = guard.load_state() or last
+                    watched[index] = (guard, state)
+                    actions = guard.check_locked(state, walk)
+                if actions:
+                    found = (guard, state, actions)
+                    break
+        except FileNotFoundError:
+            log(f"guard {name}: state removed; exiting")
+            return 0
+        if found is not None:
+            guard, state, actions = found
             paused = pause(docker, sandbox)
             log(f"guard {name}: {'paused' if paused else 'could not pause'} the sandbox")
             _tell(guard, state["root"], actions)
@@ -909,7 +1112,7 @@ def run(paths: Paths, name: str) -> int:
             time.sleep(CHECK_INTERVAL)
             continue
         try:
-            watcher.update({d for d in guard.watch if os.path.isdir(d)})
+            watcher.update({d for guard, _ in watched for d in guard.watch if os.path.isdir(d)})
             watcher.wait(CHECK_INTERVAL)
         except OSError as exc:
             log(f"guard {name}: inotify failed ({exc}); polling")
@@ -934,29 +1137,52 @@ def _diff(before: Path | None, after: Path | None, label: str) -> list[str]:
     return diff
 
 
+def _alerts(paths: Paths, sandbox: Sandbox) -> list[tuple[Path, Guard]]:
+    """Each root (with its guard) whose guard holds an alert, a root no longer
+    mounted included."""
+    found: list[tuple[Path, Guard]] = []
+    for guard in recorded(paths, sandbox.name):
+        if guard.alert_file.exists():
+            state = guard.load_state() or {}
+            found.append((Path(state.get("root") or sandbox.project_dir), guard))
+    return found
+
+
 def report(paths: Paths, sandbox: Sandbox) -> list[str]:
-    """Lines describing the pending alert (empty if there is none)."""
-    guard = Guard(paths, sandbox.name)
-    alert = guard.load_alert()
-    if not alert:
-        return []
-    lines = [f"The kbx guard stopped these changes in {sandbox.project_dir}:"]
-    for action in alert["findings"]:
-        lines.append(f"  {action['time']}  {action['path']}: {action['detail']}")
-        lines.append(f"      → {action.get('action', '?')}")
-        saved = action.get("quarantine")
-        if saved:
-            lines.append(f"      agent's version: {saved}")
-            current = sandbox.project_dir / action["path"]
-            for line in _diff(current if current.exists() else None, Path(saved), action["path"]):
-                lines.append("      " + line.rstrip("\n"))
+    """Lines describing the pending alerts (empty if there is none)."""
+    lines: list[str] = []
+    for root, guard in _alerts(paths, sandbox):
+        alert = guard.load_alert()
+        if not alert:
+            continue
+        lines.append(f"The kbx guard stopped these changes in {root}:")
+        for action in alert["findings"]:
+            lines.append(f"  {action['time']}  {action['path']}: {action['detail']}")
+            lines.append(f"      → {action.get('action', '?')}")
+            saved = action.get("quarantine")
+            if saved:
+                lines.append(f"      agent's version: {saved}")
+                current = root / action["path"]
+                for line in _diff(current if current.exists() else None, Path(saved), action["path"]):
+                    lines.append("      " + line.rstrip("\n"))
     return lines
 
 
 def resolve(paths: Paths, sandbox: Sandbox, protect: Sequence[str], accept: bool) -> list[str]:
-    """Clear the alert. With accept, put the quarantined versions back first.
-    Either way the result becomes the new baseline."""
-    guard = Guard(paths, sandbox.name)
+    """Clear the alerts. With accept, put the quarantined versions back first.
+    Either way the result becomes the new baseline, of every mounted root."""
+    notes: list[str] = []
+    for root, guard in _alerts(paths, sandbox):
+        notes += _resolve_root(guard, root, accept)
+    for root, guard in guards(paths, sandbox):
+        if root.is_dir():
+            with guard.lock():
+                guard.trust_locked(root, protect)
+    _forget_other_roots(paths, sandbox)
+    return notes
+
+
+def _resolve_root(guard: Guard, root: Path, accept: bool) -> list[str]:
     notes: list[str] = []
     with guard.lock():
         alert = guard.load_alert() or {"findings": []}
@@ -965,7 +1191,7 @@ def resolve(paths: Paths, sandbox: Sandbox, protect: Sequence[str], accept: bool
                 saved = action.get("quarantine")
                 if not saved or not (Path(saved).exists() or Path(saved).is_symlink()):
                     continue
-                dest = sandbox.project_dir / action["path"]
+                dest = root / action["path"]
                 if dest.is_dir() and not dest.is_symlink():
                     shutil.rmtree(dest)
                 elif dest.is_symlink() or dest.exists():
@@ -976,8 +1202,7 @@ def resolve(paths: Paths, sandbox: Sandbox, protect: Sequence[str], accept: bool
                 else:
                     shutil.copy2(saved, dest, follow_symlinks=False)
                 notes.append(f"restored {action['path']} (the agent's version)")
-        guard.alert_file.unlink(missing_ok=True)
-        guard.trust_locked(sandbox.project_dir, protect)
+        guard.alert_file.unlink(missing_ok=True)  # resolve() takes the new baselines
     return notes
 
 

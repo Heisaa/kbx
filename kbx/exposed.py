@@ -9,11 +9,16 @@ Only untracked files count (ignored ones included): committed files travel
 with the repository anyway, and `.env.example` and the like are templates.
 Fully untracked directories are judged by their name only (`secrets/`), so
 this is a reminder, not an audit.
+
+A profile mounts whole directories: every repository in them is checked the
+same way, and outside repositories every file counts, by its name.
 """
 
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Sequence
 from fnmatch import fnmatchcase
 from pathlib import Path
 
@@ -33,6 +38,8 @@ PATTERNS = (
 )  # fmt: skip
 TEMPLATE_WORDS = frozenset({"example", "sample", "template", "dist", "defaults"})
 SHOWN = 10
+MAX_DIRS = 50_000  # a profile's roots: stop looking after this many directories
+SKIP = frozenset({"node_modules", ".git", "__pycache__", ".venv", "venv", ".tox", ".nox", "target"})
 
 
 def looks_secret(rel: str) -> bool:
@@ -45,25 +52,80 @@ def looks_secret(rel: str) -> bool:
 def secret_files(project: Path) -> list[str]:
     """Untracked paths in the checkout whose names look like secrets; [] if git fails."""
     # --directory lists a fully untracked directory (node_modules/, secrets/) as one entry.
-    result = host_git(project, "ls-files", "-z", "--others", "--directory", "--no-empty-directory", check=False)
+    result = host_git(
+        project,
+        *("-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"),
+        *("ls-files", "-z", "--others", "--directory", "--no-empty-directory"),
+        check=False,
+    )
     if result.returncode != 0:
         return []
     return sorted(rel for rel in result.stdout.split("\0") if rel and looks_secret(rel))
+
+
+def root_files(root: Path) -> tuple[list[str], bool]:
+    """Secret-looking paths under a profile root, relative to it: untracked ones
+    in each repository, any outside. True if the search stopped early."""
+    found: list[str] = []
+    seen = 0
+    for current, dirs, files in os.walk(root):
+        base = Path(current)
+        seen += 1
+        if seen > MAX_DIRS:
+            return sorted(found), True
+        prefix = "" if base == root else f"{base.relative_to(root)}/"
+        if ".git" in dirs or ".git" in files:
+            found += [prefix + rel for rel in secret_files(base)]
+            dirs[:] = []  # the repository's own listing covers what is inside
+            continue
+        found += [prefix + name for name in files if looks_secret(name)]
+        found += [f"{prefix}{name}/" for name in dirs if looks_secret(name)]
+        dirs[:] = sorted(d for d in dirs if d not in SKIP and not looks_secret(d) and not (base / d).is_symlink())
+    return sorted(found), False
+
+
+def _listing(found: Sequence[str]) -> list[str]:
+    listed = [f"    {rel}" for rel in found[:SHOWN]]
+    if len(found) > SHOWN:
+        listed.append(f"    … and {len(found) - SHOWN} more")
+    return listed
 
 
 def warning(project: Path) -> str | None:
     found = secret_files(project)
     if not found:
         return None
-    listed = [f"    {rel}" for rel in found[:SHOWN]]
-    if len(found) > SHOWN:
-        listed.append(f"    … and {len(found) - SHOWN} more")
     return "\n".join(
         [
             "the agent will be able to read these files in your checkout, and the internet is open, "
             "so a prompt-injected agent could send them out:",
-            *listed,
+            *_listing(found),
             "  Keep only secrets here you could afford to lose (test or spend-limited keys), "
             'or use [workspace] mode = "clone", which leaves untracked files on the host.',
         ]
     )
+
+
+def roots_warning(roots: Sequence[Path]) -> str | None:
+    """The same for a profile: every root, with every project in it."""
+    found: list[str] = []
+    partial: list[Path] = []
+    for root in roots:
+        files, stopped = root_files(root)
+        found += [str(root / rel) + ("/" if rel.endswith("/") else "") for rel in files]
+        if stopped:
+            partial.append(root)
+    if not found and not partial:
+        return None
+    lines = [
+        "the agent will be able to read these files in the profile's directories, and the internet is open, "
+        "so a prompt-injected agent could send them out:",
+        *_listing(found),
+    ]
+    if partial:
+        lines.append(f"  (stopped looking after {MAX_DIRS} directories in {', '.join(map(str, partial))})")
+    lines.append(
+        "  Keep only secrets here you could afford to lose (test or spend-limited keys); every project "
+        "in the profile is readable by every agent in it."
+    )
+    return "\n".join(lines)

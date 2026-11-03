@@ -54,3 +54,25 @@ class SecretFilesTest(TempHome):
 
     def test_not_a_repository(self) -> None:
         self.assertEqual(exposed.secret_files(self.temp), [])
+
+
+class RootsTest(TempHome):
+    def test_profile_roots(self) -> None:
+        root = self.temp / "work"
+        api = self.make_repo("work/api")
+        (api / ".env").write_text("KEY=x\n")
+        (root / "notes" / "keys").mkdir(parents=True)
+        (root / "notes" / "keys" / "id_ed25519").write_text("")
+        (root / "notes" / "secrets").mkdir()
+        (root / "notes" / "secrets" / "inside").write_text("")
+        (root / "node_modules").mkdir()
+        (root / "node_modules" / "x.pem").write_text("")
+        self.assertEqual(exposed.root_files(root), (["api/.env", "notes/keys/id_ed25519", "notes/secrets/"], False))
+        text = exposed.roots_warning([root])
+        assert text is not None
+        self.assertIn(f"    {root}/api/.env\n", text)
+        self.assertIn(f"    {root}/notes/secrets/", text)
+        self.assertIn("every agent in it", text)
+        clean = self.temp / "clean"
+        clean.mkdir()
+        self.assertIsNone(exposed.roots_warning([clean]))

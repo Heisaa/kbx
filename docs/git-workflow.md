@@ -12,6 +12,9 @@ kbx has two workspace modes (`[workspace] mode` in
 The mode is fixed when the sandbox is created. `kbx recreate` switches to the
 configured mode and keeps the volumes.
 
+A [profile](profiles.md) shares whole directories of projects in mount mode.
+Everything below about mount mode and the guard applies to each project in it.
+
 # Mount mode
 
 The project is the git top-level containing your current directory. It is
