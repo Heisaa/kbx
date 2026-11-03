@@ -806,7 +806,7 @@ Generic features only. Anything opinionated is off by default.
 | `claude-statusline` | off | `home/.claude/statusline.mjs` (sandbox name, model, dir, branch, context, plan quota) and `home/.claude/settings.json` (`statusLine`) |
 | `codex-statusline` | off | `home/.codex/config.toml` with `tui.status_line = ["context-used", "five-hour-limit", "weekly-limit"]` |
 | `codex-reset-fast` | off | `start.sh`: remove a persisted `service_tier = "fast"` from Codex config on every start, so Fast mode never silently carries over between sessions. The launcher also runs it before each Codex launch |
-| `voice` | off | `build.sh`: PulseAudio, alsa-utils, a fixed ALSA pulse plugin. `start.sh` + `service`: PulseAudio with FIFO-backed microphone and speaker; `link.py` reports their use over a host-initiated `docker exec`. The host side (`voice.py`) is launcher core and gated on this module |
+| `voice` | off | Seeds Codex's `features.realtime_conversation = true`. `build.sh`: PulseAudio, alsa-utils, a fixed ALSA pulse plugin. `start.sh` + `service`: PulseAudio with FIFO-backed microphone and speaker; `link.py` reports their use over a host-initiated `docker exec`. The host side (`voice.py`) is launcher core and gated on this module |
 
 ### User modules and templates
 

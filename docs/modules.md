@@ -150,7 +150,7 @@ more than 5 exits in a minute. `dockerd` is supervised the same way. Status:
 | `claude-statusline` | off | `~/.claude/statusline.mjs` and the `statusLine` setting |
 | `codex-statusline` | off | `tui.status_line = ["context-used", "five-hour-limit", "weekly-limit"]` |
 | `codex-reset-fast` | off | `start.sh`: remove a persisted `service_tier = "fast"` at every start and before each Codex launch |
-| `voice` | off | `build.sh`: PulseAudio, alsa-utils and a fixed ALSA pulse plugin (about 200 MB). `start.sh` + `service`: a PulseAudio server whose microphone and speaker the host connects while attached. Host side is `kbx`'s voice link |
+| `voice` | off | Seeds Codex's `features.realtime_conversation = true`. `build.sh`: PulseAudio, alsa-utils and a fixed ALSA pulse plugin (about 200 MB). `start.sh` + `service`: a PulseAudio server whose microphone and speaker the host connects while attached. Host side is `kbx`'s voice link |
 
 Notes worth knowing:
 
@@ -207,6 +207,30 @@ The `voice` module is off by default. Turn it on with `voice = true` under
 `[modules]`, then `kbx build && kbx recreate`. Claude's `/voice` (hold Space to
 talk) and Codex's `/voice` (a spoken conversation; Codex answers out loud) then
 use the microphone and speakers of the host you are attached from.
+
+For a Codex voice conversation:
+
+1. Enable the module in `~/.config/kbx/config.toml`:
+
+   ```toml
+   [modules]
+   voice = true
+   ```
+
+2. Run `kbx build && kbx recreate`, then `kbx codex`. Keep automatic updates
+   enabled (the default), or run `kbx update` to install the current
+   native Codex package, including its voice helper and libraries.
+3. Start a conversation in Codex, then type `/voice` to talk. Use
+   `/voice mute` to toggle your microphone, `/voice stop` to end the voice
+   conversation, and `/voice settings` to choose audio devices.
+
+The module seeds `features.realtime_conversation = true` in the sandbox's
+`~/.codex/config.toml`, including before Codex launches in an existing home
+volume. An explicit `false` already in that file is preserved; change it to
+`true` if you want to enable conversations. Start a new Codex session after
+changing the setting. If `/voice` is unavailable, check that setting and your
+Codex version. For audio failures, check the voice-link log listed by
+`kbx logs` and confirm the host tools below are installed.
 
 The VM has no sound hardware, and the sandbox never connects to the host:
 

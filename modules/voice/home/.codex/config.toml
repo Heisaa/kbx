@@ -1,0 +1,3 @@
+# Make /voice available on Codex versions that gate conversation mode.
+[features]
+realtime_conversation = true

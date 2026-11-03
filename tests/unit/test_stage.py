@@ -60,6 +60,25 @@ class StageTest(TempHome):
         self.assertEqual((root / "skills/review/SKILL.md").read_text(), "v2\n")
         self.assertTrue((root / "skills/new/SKILL.md").is_file())
 
+    def test_voice_conversations_are_opt_in_and_preserve_user_settings(self) -> None:
+        home = self.temp / "sandbox-home"
+        home.mkdir()
+        args = ["--stage", str(self.paths.stage), "--home", str(home), "--only-prefix", ".codex/", "--quiet"]
+        target = home / ".codex/config.toml"
+        self.restage()
+        self.assertEqual(seed.main(args), 0)
+        self.assertNotIn("realtime_conversation", tomllib.loads(target.read_text()).get("features", {}))
+
+        # Enable voice in an existing volume; prelaunch seeding adds the feature.
+        self.restage("[modules]\nvoice = true\n")
+        self.assertEqual(seed.main(args), 0)
+        self.assertTrue(tomllib.loads(target.read_text())["features"]["realtime_conversation"])
+
+        # It is a default, so a user's explicit opt-out survives later launches.
+        target.write_text(target.read_text().replace("realtime_conversation = true", "realtime_conversation = false"))
+        self.assertEqual(seed.main(args), 0)
+        self.assertFalse(tomllib.loads(target.read_text())["features"]["realtime_conversation"])
+
     def test_permission_defaults_seed_before_each_agent_launch(self) -> None:
         self.restage()
         home = self.temp / "sandbox-home"

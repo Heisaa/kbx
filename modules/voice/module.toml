@@ -1,4 +1,4 @@
-description = "Voice input for Claude and Codex: the host microphone and speakers while attached (adds about 200 MB)"
+description = "Claude voice input and Codex voice conversations with the host microphone and speakers while attached (adds about 200 MB)"
 default = false
 
 [start]
