@@ -45,6 +45,7 @@ class ModulesTest(TempHome):
                 "node-toolchain",
                 "notify",
                 "playwright",
+                "rust",
                 "voice",
             },
         )
@@ -52,6 +53,20 @@ class ModulesTest(TempHome):
         self.assertEqual([r.name for r in resolved], ["agent-permissions", "clipboard", "codex-chatgpt-auth", "notify"])
         issues = [i for i in modules.check(found, resolved) if i.level == "error"]
         self.assertEqual(issues, [])
+
+    def test_rust_options(self) -> None:
+        found = modules.discover(self.paths)
+        text = (
+            '[modules]\nrust = true\n[options.rust]\ntoolchain = "nightly-2026-10-01"\nextra = "1.85 stable"\n'
+            'targets = "wasm32-unknown-unknown x86_64-unknown-linux-musl"\n'
+        )
+        rust = next(r for r in modules.resolve(found, self.cfg(text)) if r.name == "rust")
+        self.assertEqual(rust.option_env()["KBX_OPT_RUST_TOOLCHAIN"], "nightly-2026-10-01")
+        self.assertEqual(rust.option_env()["KBX_OPT_RUST_COMPONENTS"], "clippy rustfmt")
+        self.assertEqual(rust.module.env["RUSTUP_HOME"], "/opt/rust/rustup")
+        for bad in ('toolchain = "stable; curl x | sh"', 'targets = "--evil"', 'extra = "$(id)"'):
+            with self.subTest(bad=bad), self.assertRaises(KbxError):
+                modules.resolve(found, self.cfg(f"[modules]\nrust = true\n[options.rust]\n{bad}\n"))
 
     def test_all_builtins_enabled_have_no_conflicts(self) -> None:
         found = modules.discover(self.paths)

@@ -101,6 +101,34 @@ kbx seed --reset NAME   # restore a module's defaults (asks first)
 Seeds under an agent's directory (`.claude/`, `.codex/`, `.pi/`) are also
 reapplied right before that agent launches.
 
+## Rust
+
+The `rust` module installs the toolchain into the image, so it is in every
+sandbox, profiles included:
+
+```toml
+[modules]
+rust = true
+
+[options.rust]
+toolchain = "stable"                 # or "1.89", "nightly-2026-10-01"
+extra = "1.85"                       # toolchains your projects pin, preinstalled
+components = "clippy rustfmt rust-analyzer"
+targets = "wasm32-unknown-unknown"
+apt = "pkg-config libssl-dev libpq-dev"
+```
+
+Then `kbx build && kbx recreate` (in each sandbox or profile that should get
+it). `cargo`, `rustc`, `rustup` and the other tools are in `/usr/local/bin`.
+Crates you download (`~/.cargo/registry`) and `cargo install` output
+(`~/.local/bin`) stay in the home volume. Builds go to the sandbox's own
+`target/` (`[workspace] private`), so the host's builds and the sandbox's do
+not invalidate each other.
+
+A project's `rust-toolchain.toml` can ask for a toolchain the image lacks;
+rustup then installs it on demand into `/opt/rust`. That copy is kept across
+stops but is gone after `kbx recreate`, so list such toolchains in `extra`.
+
 ## Services
 
 `kbx-init` runs each enabled module's `service` in the foreground under a small
@@ -118,6 +146,7 @@ more than 5 exits in a minute. `dockerd` is supervised the same way. Status:
 | `notify` | on | Seeds Claude Code hooks (`UserPromptSubmit`, `PostToolUse`, `Notification`, `Stop`, `SessionEnd`) and Codex's `notify` to run `kbx-notify`, which records what each session does for the host's notifications and the dashboard |
 | `node-toolchain` | off | `build.sh`: a chosen Node (`version`), extra `apt` and global `npm` packages |
 | `playwright` | off | `build.sh`: Playwright + Chromium + a `chromium` wrapper (~500 MB). `[env]` sets the browsers path |
+| `rust` | off | `build.sh`: rustup (checksum-verified) and a `toolchain` (default `stable`) with `components` (`clippy rustfmt`), `targets`, `extra` toolchains and `apt` packages crates link against (`pkg-config libssl-dev`), under `/opt/rust` (~1 GB). The registry cache and `cargo install` output stay in the home volume |
 | `claude-statusline` | off | `~/.claude/statusline.mjs` and the `statusLine` setting |
 | `codex-statusline` | off | `tui.status_line = ["context-used", "five-hour-limit", "weekly-limit"]` |
 | `codex-reset-fast` | off | `start.sh`: remove a persisted `service_tier = "fast"` at every start and before each Codex launch |

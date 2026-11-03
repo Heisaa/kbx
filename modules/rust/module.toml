@@ -1,0 +1,15 @@
+description = "Rust toolchain from rustup (cargo, rustc, clippy, rustfmt), checksum-verified (adds about 1 GB)"
+default = false
+
+[options]
+toolchain = { default = "stable", pattern = '^(stable|beta|nightly|[0-9]+\.[0-9]+(\.[0-9]+)?)(-[0-9]{4}-[0-9]{2}-[0-9]{2})?$', description = "Default toolchain: stable, beta, nightly, 1.89, 1.89.0, nightly-2026-10-01" }
+extra = { default = "", pattern = '^((stable|beta|nightly|[0-9]+\.[0-9]+(\.[0-9]+)?)(-[0-9]{4}-[0-9]{2}-[0-9]{2})?( (stable|beta|nightly|[0-9]+\.[0-9]+(\.[0-9]+)?)(-[0-9]{4}-[0-9]{2}-[0-9]{2})?)*)?$', description = "More toolchains to preinstall (what projects pin in rust-toolchain.toml), space separated" }
+components = { default = "clippy rustfmt", pattern = '^([a-z][a-z0-9-]*( [a-z][a-z0-9-]*)*)?$', description = "rustup components for every installed toolchain, e.g. rust-analyzer rust-src" }
+targets = { default = "", pattern = '^([a-z0-9_]+(-[a-z0-9_.]+)+( [a-z0-9_]+(-[a-z0-9_.]+)+)*)?$', description = "Extra compile targets, e.g. wasm32-unknown-unknown x86_64-unknown-linux-musl" }
+apt = { default = "pkg-config libssl-dev", pattern = '^([a-z0-9][a-z0-9+.:=~-]*( [a-z0-9][a-z0-9+.:=~-]*)*)?$', description = "apt packages crates commonly link against, space separated" }
+
+[env]
+# The toolchains live in the image; the registry cache and `cargo install`
+# output stay in the home volume (~/.cargo, ~/.local/bin, which is on PATH).
+RUSTUP_HOME = "/opt/rust/rustup"
+CARGO_INSTALL_ROOT = "/home/agent/.local"

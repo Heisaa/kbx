@@ -9,6 +9,7 @@
 # codex-chatgpt-auth = true   # Codex uses ChatGPT login (needed for remote control)
 # node-toolchain = false
 # playwright = false
+# rust = false                # rustup toolchain: cargo, rustc, clippy, rustfmt (~1 GB)
 # claude-statusline = false
 # codex-statusline = false
 # codex-reset-fast = false
@@ -19,6 +20,13 @@
 # version = "26"              # major, exact x.y.z, or "" to keep the core LTS
 # apt = "postgresql-client"
 # npm = "typescript@5.9.2 pnpm"
+
+# [options.rust]
+# toolchain = "stable"        # also "1.89", "nightly-2026-10-01"
+# extra = ""                  # more toolchains to preinstall, e.g. "1.85"
+# components = "clippy rustfmt"
+# targets = ""                # e.g. "wasm32-unknown-unknown"
+# apt = "pkg-config libssl-dev"
 
 # [options.playwright]
 # version = "1.63.0"

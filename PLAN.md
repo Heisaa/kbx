@@ -802,6 +802,7 @@ Generic features only. Anything opinionated is off by default.
 | `codex-chatgpt-auth` | **on** | `home/.codex/config.toml` with `forced_login_method = "chatgpt"` and `model_provider = "openai"`, both in `enforce`. Required for Codex remote control; turn it off to keep API-key auth |
 | `node-toolchain` | off | `build.sh`: a chosen Node version from nodejs.org with checksum, plus `libatomic1`. Options `version`, `apt` (extra apt packages), `npm` (extra global npm packages) |
 | `playwright` | off | `build.sh`: Playwright + Chromium + a `chromium` wrapper. Adds about 500 MB |
+| `rust` | off | `build.sh`: rustup with its checksum verified, a default `toolchain`, `extra` toolchains, `components`, `targets` and `apt` packages, under a world-writable `/opt/rust` (so `rust-toolchain.toml` can install on demand); wrappers in `/usr/local/bin` find it without the module's environment. `[env]`: `RUSTUP_HOME`, and `CARGO_INSTALL_ROOT=~/.local` so installed binaries land on `PATH` in the home volume |
 | `claude-statusline` | off | `home/.claude/statusline.mjs` (sandbox name, model, dir, branch, context, plan quota) and `home/.claude/settings.json` (`statusLine`) |
 | `codex-statusline` | off | `home/.codex/config.toml` with `tui.status_line = ["context-used", "five-hour-limit", "weekly-limit"]` |
 | `codex-reset-fast` | off | `start.sh`: remove a persisted `service_tier = "fast"` from Codex config on every start, so Fast mode never silently carries over between sessions. The launcher also runs it before each Codex launch |
