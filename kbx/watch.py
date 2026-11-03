@@ -7,8 +7,10 @@ the guard). It follows `kbx-notify follow` in the sandbox over one long-lived
 - sends a desktop notification when an agent finishes a turn or waits for an
   approval ([launcher] notify: only while no terminal is attached to that
   session, always, or off);
-- stops the sandbox after [launcher] idle_stop with no agent session and no
-  interactive shell, the same way `kbx stop` does (the guard seals as usual).
+- stops the sandbox as soon as its last agent session closes (once no
+  interactive shell is left either), or after [launcher] idle_stop with no
+  agent session and no shell when none was open, the same way `kbx stop`
+  does (the guard seals as usual). idle_stop "off" turns both off.
 
 Everything read from the sandbox is untrusted: fields are type-checked,
 cleaned of control characters, cut short, and escaped for the notification
@@ -51,6 +53,7 @@ MAX_PER_MINUTE = 6  # per sandbox: a chatty (or hostile) agent cannot flood the 
 MAX_TITLE = 80
 MAX_BODY = 200
 QUIET_STOP = 30 * 60  # an idle stop sooner than this follows a close: no notification
+SETTLE = 2.0  # after the last session closed: let its `docker exec` end, or a new launch show up
 STATES = ("working", "waiting", "done")
 LIVE = ("running", "paused", "restarting")
 
@@ -223,14 +226,24 @@ class Idle:
     limit: float  # seconds; 0 = never stop
     since: float  # monotonic time of the last activity
     sessions: dict[str, dict[str, Any]] | None = None  # None: not known yet
+    closed: bool = False  # the last session closed and none opened since: stop without waiting
 
     def active(self, now: float) -> None:
         self.since = now
 
+    def update(self, sessions: dict[str, dict[str, Any]]) -> bool:
+        """New session list. True if that closed the last session."""
+        last_closed = bool(self.sessions) and not sessions
+        self.sessions = sessions
+        self.closed = last_closed or (self.closed and not sessions)
+        return last_closed
+
     def due(self, now: float, shells: int) -> bool:
         if self.sessions is None or self.sessions or shells:
             self.since = now
-        return self.limit > 0 and now - self.since >= self.limit
+        if self.limit <= 0:
+            return False
+        return (self.closed and not self.sessions and not shells) or now - self.since >= self.limit
 
 
 # --- the loop ---
@@ -249,6 +262,7 @@ class Watcher:
         self.mode = self.sandbox.mode
         self.notifier = Notifier(config.launcher.notify, self.project)
         self.idle = Idle(float(config.launcher.idle_stop), time.monotonic())
+        self.next_check = time.monotonic() + CHECK_INTERVAL
 
     @property
     def title(self) -> str:
@@ -267,7 +281,8 @@ class Watcher:
             return
         now = time.monotonic()
         if data.get("type") == "sessions":
-            self.idle.sessions = parse_sessions(data)  # pyright: ignore[reportUnknownArgumentType]
+            if self.idle.update(parse_sessions(data)) and self.idle.limit > 0:  # pyright: ignore[reportUnknownArgumentType]
+                self.next_check = min(self.next_check, now + SETTLE)
         elif data.get("type") == "event":
             event = parse_event(data)  # pyright: ignore[reportUnknownArgumentType]
             if event is not None:
@@ -293,8 +308,15 @@ class Watcher:
         """True if the sandbox was stopped."""
         if guard.alerted(self.paths, self.name):
             return False
+        closed = self.idle.closed
+        if closed:
+            live = sandbox_mod.sessions(self.docker, self.name)
+            if live:  # a launch opened one since the last report: not idle
+                self.idle.update({key: {} for key in live})
+                self.idle.active(time.monotonic())
+                return False
         minutes = round(self.idle.limit / 60)
-        log(f"idle for {minutes} min (no agent session, no shell); stopping")
+        log("last session closed; stopping" if closed else f"idle for {minutes} min (no agent session, no shell); stopping")
         try:
             sandbox_mod.stop(self.docker, self.sandbox)
         except KbxError as exc:
@@ -305,7 +327,7 @@ class Watcher:
             actions = guard.seal(self.paths, self.name)
             if actions:
                 log(f"guard: {guard.summary(actions)}")
-        if self.config.launcher.notify != "off" and self.idle.limit >= QUIET_STOP:
+        if not closed and self.config.launcher.notify != "off" and self.idle.limit >= QUIET_STOP:
             send(
                 clean(f"kbx stopped {self.title}")[:MAX_TITLE],
                 f"Idle for {minutes} min. It starts again at the next kbx command.",
@@ -331,10 +353,11 @@ class Watcher:
 
     def _read(self, stream: IO[bytes]) -> bool:
         buffer = b""
-        next_check = time.monotonic() + CHECK_INTERVAL
+        self.next_check = time.monotonic() + CHECK_INTERVAL
         fd = stream.fileno()
         while True:
-            ready, _, _ = select.select([fd], [], [], READ_TIMEOUT)
+            timeout = min(READ_TIMEOUT, max(0.0, self.next_check - time.monotonic()))
+            ready, _, _ = select.select([fd], [], [], timeout)
             if ready:
                 chunk = os.read(fd, 65536)
                 if not chunk:
@@ -344,15 +367,15 @@ class Watcher:
                 for raw in lines:
                     self.line(raw)
                 buffer = buffer[-65536:]  # a line longer than this is not an event
-            if time.monotonic() >= next_check:
-                next_check = time.monotonic() + CHECK_INTERVAL
+            if time.monotonic() >= self.next_check:
+                self.next_check = time.monotonic() + CHECK_INTERVAL
                 if not self.check():
                     return False
 
     def poll(self) -> None:
         """No kbx-notify in the image: sessions every POLL_INTERVAL, for the idle stop only."""
         while True:
-            self.idle.sessions = {name: {} for name in sandbox_mod.sessions(self.docker, self.name)}
+            self.idle.update({name: {} for name in sandbox_mod.sessions(self.docker, self.name)})
             if not self.check():
                 return
             time.sleep(POLL_INTERVAL)

@@ -125,18 +125,21 @@ class SessionStatusTest(Base):
 
 
 class FollowTest(Base):
-    def test_follow_streams_new_events_and_sessions(self) -> None:
-        self.live_session("claude")
-        notify.record("claude", "working", "", self.states)  # before follow: not replayed
+    def follow(self, tick: float) -> subprocess.Popen[str]:
         script = (
-            "import sys; from functools import partial; from pathlib import Path; from kbx_sandbox import notify, session;"
-            f"session.SESSIONS = Path({str(self.sessions)!r}); session.STATES = Path({str(self.states)!r});"
-            "session.status = partial(session.status, session.SESSIONS, session.STATES);"
-            f"notify.follow(Path({str(self.states)!r}), tick=0.3, poll=0.05)"
+            "from pathlib import Path; from kbx_sandbox import notify;"
+            f"notify.follow(Path({str(self.states)!r}), tick={tick}, poll=0.05, sessions=Path({str(self.sessions)!r}))"
         )
         env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
         process = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True, env=env)
+        self.addCleanup(process.wait)
         self.addCleanup(process.kill)
+        return process
+
+    def test_follow_streams_new_events_and_sessions(self) -> None:
+        self.live_session("claude")
+        notify.record("claude", "working", "", self.states)  # before follow: not replayed
+        process = self.follow(tick=0.3)
         assert process.stdout is not None
         first = json.loads(process.stdout.readline())
         self.assertEqual(first["type"], "sessions")
@@ -146,6 +149,18 @@ class FollowTest(Base):
         lines = [json.loads(process.stdout.readline()) for _ in range(2)]
         event = next(line for line in lines if line["type"] == "event")
         self.assertEqual((event["agent"], event["state"], event["attached"]), ("claude", "done", False))
+
+    def test_a_closed_session_is_reported_at_once(self) -> None:
+        server = self.live_session("claude")
+        process = self.follow(tick=60)  # no periodic update during the test
+        assert process.stdout is not None
+        self.assertIn("claude", json.loads(process.stdout.readline())["sessions"])
+        server.close()
+        (self.sessions / "claude.sock").unlink()  # as dtach does when its master exits
+        started = time.monotonic()
+        update = json.loads(process.stdout.readline())
+        self.assertEqual(update, {"type": "sessions", "sessions": {}})
+        self.assertLess(time.monotonic() - started, 5)
 
 
 class ProfileSessionTest(Base):

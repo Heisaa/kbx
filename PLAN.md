@@ -1044,9 +1044,13 @@ terminal is attached to that session, always, or off), at most once a minute
 for the same text and six a minute in all. The text is untrusted: type-checked, control characters
 removed, cut short, markup escaped, and passed after `--`.
 
-**Idle stop.** The same watcher stops the sandbox after `[launcher]
-idle_stop` (2 h) with no agent session (from the stream's periodic session
-list) and no interactive `docker exec` into it (host `/proc`), the way `kbx
+**Idle stop.** The same watcher stops the sandbox about two seconds after its
+last agent session closes (the stream reports the session list whenever a
+socket in `/run/kbx/sessions` appears or disappears; the watcher asks
+`kbx-session list` once more before stopping, in case a launch just opened
+one), and otherwise after `[launcher] idle_stop` (2 h) with no agent session
+(from the stream's periodic session list); never with an interactive `docker
+exec` into it (host `/proc`). It stops the way `kbx
 stop` does; the guard seals as usual. Never while paused or with a guard
 alert pending. An image without `kbx-notify` falls back to polling
 `kbx-session list` for the idle stop only. The Codex app-server daemon does

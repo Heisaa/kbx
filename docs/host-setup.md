@@ -103,7 +103,7 @@ to refuse instead whenever the total VM limits would exceed it.
 
 To reserve less per sandbox, lower `[launcher] memory` (for example `"4g"`) and
 recreate the existing containers so their stored limits change. Sandboxes stop
-5 minutes after their last session and shell close (`idle_stop`).
+as soon as their last session closes, once no shell is open either (`idle_stop`).
 
 With Cloud Hypervisor, `reclaim_guest_freed_memory = true` (in
 `host/kata-configuration.toml`; the installer sets it in a new configuration)

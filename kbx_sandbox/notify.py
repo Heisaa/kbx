@@ -12,7 +12,8 @@ key in them (`claude`, or `claude@<project>` in a profile sandbox, see
 kbx-session), so an agent run by hand in `kbx shell` stays quiet.
 
   kbx-notify follow          for the host: every new event as a JSON line, and
-                             the live sessions every TICK seconds
+                             the live sessions every TICK seconds and as soon
+                             as one opens or closes
 
 A hook must never slow down or break its agent: failures are ignored and
 nothing is printed (Claude adds a UserPromptSubmit hook's output to the prompt).
@@ -120,13 +121,24 @@ def _emit(data: Mapping[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def follow(root: Path = STATES, tick: float = TICK, poll: float = POLL) -> None:
+def _sockets(root: Path) -> frozenset[str]:
+    """Session socket names: cheap to list every poll; dtach removes its socket on exit."""
+    try:
+        return frozenset(path.name for path in root.glob("*.sock"))
+    except OSError:
+        return frozenset()
+
+
+def follow(
+    root: Path = STATES, tick: float = TICK, poll: float = POLL, sessions: Path = session.SESSIONS
+) -> None:
     events = root / EVENTS.name
     try:
         offset = events.stat().st_size
     except OSError:
         offset = 0
-    _emit({"type": "sessions", "sessions": session.status()})
+    sockets = _sockets(sessions)
+    _emit({"type": "sessions", "sessions": session.status(sessions, root)})
     next_tick = time.monotonic() + tick
     while True:
         try:
@@ -150,11 +162,13 @@ def follow(root: Path = STATES, tick: float = TICK, poll: float = POLL) -> None:
                     key = str(event.get("session") or event.get("agent", ""))
                     if not session.valid(key):
                         continue
-                    event["attached"] = session.attached(session.SESSIONS / f"{key}.sock")
+                    event["attached"] = session.attached(sessions / f"{key}.sock")
                     _emit({"type": "event", **event})
-        if time.monotonic() >= next_tick:
+        now_sockets = _sockets(sessions)
+        if time.monotonic() >= next_tick or now_sockets != sockets:
+            sockets = now_sockets  # a session opened or closed: say so now, for the idle stop
             next_tick = time.monotonic() + tick
-            _emit({"type": "sessions", "sessions": session.status()})
+            _emit({"type": "sessions", "sessions": session.status(sessions, root)})
         time.sleep(poll)
 
 

@@ -106,6 +106,22 @@ class IdleTest(unittest.TestCase):
         self.assertTrue(idle.due(1300, shells=0))
         self.assertFalse(watch.Idle(limit=0, since=0, sessions={}).due(10**9, shells=0), "0 = never")
 
+    def test_due_at_once_when_the_last_session_closes(self) -> None:
+        idle = watch.Idle(limit=300, since=0)
+        self.assertFalse(idle.update({}), "none to begin with: wait the full idle_stop")
+        self.assertFalse(idle.due(10, shells=0))
+        self.assertFalse(idle.update({"claude@api-1a2b3c": {}, "codex@web-abcdef": {}}))
+        self.assertFalse(idle.update({"codex@web-abcdef": {}}), "one is still open")
+        self.assertFalse(idle.due(20, shells=0))
+        self.assertTrue(idle.update({}))
+        self.assertFalse(idle.due(21, shells=1), "a shell keeps it running")
+        self.assertTrue(idle.due(51, shells=0), "until it closes too")
+        idle.update({"claude": {}})
+        self.assertFalse(idle.closed, "a new session starts over")
+        off = watch.Idle(limit=0, since=0, sessions={"claude": {}})
+        off.update({})
+        self.assertFalse(off.due(1, shells=0), "idle_stop off: never")
+
 
 class StubDocker:
     def __init__(self, state: str = "running") -> None:
@@ -140,6 +156,36 @@ class WatcherTest(TempHome):
             clock.return_value = found.idle.since + 3601  # not exactly: float rounding
             self.assertFalse(found.check(), "stopped, so the watcher ends")
         self.assertTrue(docker.stopped)
+
+    def test_stops_when_the_last_session_closes(self) -> None:
+        docker = StubDocker()
+        found = self.watcher(docker, notify="always")
+        found.line(b'{"type": "sessions", "sessions": {"claude": {}}}')
+        before = found.next_check
+        with mock.patch.object(watch.time, "monotonic", return_value=found.idle.since + 1):
+            found.line(b'{"type": "sessions", "sessions": {}}')
+        self.assertLess(found.next_check, before, "checks again soon, not in CHECK_INTERVAL")
+        with (
+            mock.patch.object(watch, "interactive_execs", return_value=0),
+            mock.patch.object(watch.sandbox_mod, "sessions", return_value=[]),
+            mock.patch.object(watch, "send") as send,
+        ):
+            self.assertFalse(found.check(), "stopped well before idle_stop (1h)")
+        self.assertTrue(docker.stopped)
+        send.assert_not_called()
+
+    def test_not_when_a_session_opened_meanwhile(self) -> None:
+        docker = StubDocker()
+        found = self.watcher(docker)
+        found.line(b'{"type": "sessions", "sessions": {"claude": {}}}')
+        found.line(b'{"type": "sessions", "sessions": {}}')
+        with (
+            mock.patch.object(watch, "interactive_execs", return_value=0),
+            mock.patch.object(watch.sandbox_mod, "sessions", return_value=["codex"]),
+        ):
+            self.assertTrue(found.check())
+        self.assertFalse(docker.stopped)
+        self.assertFalse(found.idle.closed)
 
     def test_a_stop_soon_after_a_close_is_quiet(self) -> None:
         for idle, notified in (("5m", False), ("1h", True)):

@@ -37,7 +37,7 @@
 # remote_control = true       # Claude: --remote-control; Codex: remote-control start
 # skip_onboarding = true      # Claude/Codex: skip first-run screens, trust the workdir
 # notify = "detached"         # desktop notifications: "detached", "always" or "off"
-# idle_stop = "5m"            # stop after this long without sessions or shells; "off" never
+# idle_stop = "5m"            # stop when the last session closes, or after this long with none; "off" never
 # codex_search = true         # Codex web search flags
 # shared_skills = true        # stage [skills] sources and link them for the agents
 # detach_key = "^\\"          # dtach detach key (Ctrl-\); "none" disables it
