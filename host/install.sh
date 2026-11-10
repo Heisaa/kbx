@@ -254,69 +254,203 @@ step "Kata Containers"
 # /opt/kata/bin, configuration-<hv>.toml, kata-runtime), kata-static holds
 # runtime-rs (shim in /opt/kata/runtime-rs/bin, runtime-rs/configuration-<hv>-runtime-rs.toml).
 # Both include the hypervisors and guest images. Before Kata 4, kata-static was the Go runtime.
-if [ "$kata_runtime" = rs ]; then
-  kata_shim=/opt/kata/runtime-rs/bin/containerd-shim-kata-v2
-  kata_config_src="runtime-rs/configuration-$hypervisor-runtime-rs.toml"
-  kata_config_dest=/etc/kata-containers/runtime-rs/configuration.toml
-else
-  kata_shim=/opt/kata/bin/containerd-shim-kata-v2
-  kata_config_src="configuration-$hypervisor.toml"
-  kata_config_dest=/etc/kata-containers/configuration.toml
-fi
-if skipped kata; then
-  warn "skipped"
-elif have containerd-shim-kata-v2; then
-  ok "shim: $(command -v containerd-shim-kata-v2) → $(readlink -f "$(command -v containerd-shim-kata-v2)")"
-elif $check_only; then
-  bad "Kata not installed (containerd-shim-kata-v2 not on PATH)"
-elif confirm "install Kata Containers ($kata_version, $kata_runtime runtime, ~1.2 GB download) into /opt/kata"; then
+kata_defaults=/opt/kata/share/defaults/kata-containers
+kata_shim_for() { # runtime
+  case "$1" in rs) echo /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 ;; *) echo /opt/kata/bin/containerd-shim-kata-v2 ;; esac
+}
+kata_runtime_of() { # shim path
+  case "$1" in */runtime-rs/*) echo rs ;; *) echo go ;; esac
+}
+kata_name() { # runtime
+  case "$1" in rs) echo runtime-rs ;; *) echo "Go runtime" ;; esac
+}
+# The configuration a runtime reads: the /etc copy, else the release default (QEMU).
+kata_config_of() { # runtime
+  local path
+  if [ "$1" = rs ]; then
+    set -- /etc/kata-containers/runtime-rs/configuration.toml "$kata_defaults/runtime-rs/configuration.toml"
+  else
+    set -- /etc/kata-containers/configuration.toml "$kata_defaults/configuration.toml"
+  fi
+  for path; do
+    if [ -f "$path" ]; then echo "$path"; return 0; fi
+  done
+  return 1
+}
+hypervisor_of() { # configuration file; prints nothing if it is missing
+  [ -r "$1" ] || return 0
+  sed -n 's/^\[hypervisor\.\([A-Za-z0-9_-]*\)\][[:space:]]*$/\1/p' "$1" | head -1
+}
+active_kata_shim() {
+  if have containerd-shim-kata-v2; then readlink -f "$(command -v containerd-shim-kata-v2)"; fi
+}
+# A shim process per running Kata container (matched on the program, not its arguments).
+kata_running() { pgrep -f '^([^ ]*/)?containerd-shim-kata-v2( |$)' >/dev/null 2>&1; }
+installed_kata_version() { # shim
+  "$1" --version 2>/dev/null | grep -oE 'version: "?[0-9]+\.[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+$' | head -1
+}
+# Unpack a Kata release tarball into /opt/kata and link its shim onto PATH.
+install_kata() { # version runtime
+  local version="$1" runtime="$2" arch flavour tarball shim
   case "$(uname -m)" in
     x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; s390x) arch=s390x ;; ppc64le) arch=ppc64le ;;
-    *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;;
+    *) bad "unsupported architecture $(uname -m)"; return 1 ;;
   esac
-  if [ "$kata_version" = latest ]; then
-    kata_version="$(curl -fsSL https://api.github.com/repos/kata-containers/kata-containers/releases/latest | jq -r .tag_name)"
+  if [ "$version" = latest ]; then
+    version="$(curl -fsSL https://api.github.com/repos/kata-containers/kata-containers/releases/latest | jq -r .tag_name)" || version=""
   fi
+  case "$version" in
+    "" | null) bad "cannot look up the latest Kata release (GitHub API); pass --kata-version"; return 1 ;;
+  esac
   flavour=kata-static
-  if [ "$kata_runtime" = go ] && [ "${kata_version%%.*}" -ge 4 ] 2>/dev/null; then flavour=kata-go-static; fi
-  tarball="$flavour-$kata_version-$arch.tar.zst"
+  if [ "$runtime" = go ] && [ "${version%%.*}" -ge 4 ] 2>/dev/null; then flavour=kata-go-static; fi
+  tarball="$flavour-$version-$arch.tar.zst"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   echo "  downloading $tarball…"
   curl -fL --progress-bar --retry 3 -o "$tmp/$tarball" \
-    "https://github.com/kata-containers/kata-containers/releases/download/$kata_version/$tarball"
+    "https://github.com/kata-containers/kata-containers/releases/download/$version/$tarball"
   as_root tar --zstd -xf "$tmp/$tarball" -C /
   rm -f "$tmp/$tarball"
-  if [ -x "$kata_shim" ]; then
-    as_root ln -sf "$kata_shim" /usr/local/bin/containerd-shim-kata-v2
-    [ -x /opt/kata/bin/kata-runtime ] && as_root ln -sf /opt/kata/bin/kata-runtime /usr/local/bin/kata-runtime
-    ok "Kata $kata_version ($kata_runtime runtime) installed"
+  shim="$(kata_shim_for "$runtime")"
+  if [ -x "$shim" ]; then
+    link_kata_shim "$runtime"
+    ok "Kata $version ($(kata_name "$runtime")) installed"
   else
-    bad "$tarball did not contain $kata_shim"
+    bad "$tarball did not contain $shim"
+    return 1
+  fi
+}
+link_kata_shim() { # runtime
+  as_root ln -sf "$(kata_shim_for "$1")" /usr/local/bin/containerd-shim-kata-v2
+  if [ "$1" = go ] && [ -x /opt/kata/bin/kata-runtime ]; then
+    as_root ln -sf /opt/kata/bin/kata-runtime /usr/local/bin/kata-runtime
+  fi
+}
+# Unpack the chosen runtime's release tarball at the version of the shim in use,
+# so the hypervisors and guest images it shares with that shim match.
+fetch_kata_release() {
+  local version="$kata_version"
+  if [ "$version" = latest ] && [ -n "$active_shim" ]; then
+    version="$(installed_kata_version "$active_shim")" || version=""
+  fi
+  install_kata "${version:-latest}" "$kata_runtime"
+}
+# Install the release configuration for the chosen hypervisor (keeping a backup
+# of the one there) with the settings kbx needs. Callers have checked that no
+# Kata VMs are running.
+write_kata_config() {
+  local source="$kata_defaults/$kata_config_src"
+  if [ ! -f "$source" ] && confirm "unpack the $(kata_name "$kata_runtime") release, which has $source"; then
+    fetch_kata_release || true
+  fi
+  if [ ! -f "$source" ]; then
+    bad "$source not found: it comes with the Kata release tarball (kata-go-static for the Go runtime)"
+    return 1
+  fi
+  if [ -f "$kata_config_dest" ]; then as_root cp -p "$kata_config_dest" "$kata_config_dest.kbx-backup"; fi
+  as_root install -D -m 0644 "$source" "$kata_config_dest"
+  # Only where the hypervisor has the key (Cloud Hypervisor does).
+  as_root sed -i 's/^reclaim_guest_freed_memory *=.*/reclaim_guest_freed_memory = true/' "$kata_config_dest"
+  ok "configured $hypervisor in $kata_config_dest (see host/kata-configuration.toml)"
+}
+stop_kata_first="Kata VMs are running: stop every Kata sandbox (and other Kata containers), then rerun to switch"
+
+kata_shim="$(kata_shim_for "$kata_runtime")"
+if [ "$kata_runtime" = rs ]; then
+  kata_config_src="runtime-rs/configuration-$hypervisor-runtime-rs.toml"
+  kata_config_dest=/etc/kata-containers/runtime-rs/configuration.toml
+else
+  kata_config_src="configuration-$hypervisor.toml"
+  kata_config_dest=/etc/kata-containers/configuration.toml
+fi
+active_shim="$(active_kata_shim)"
+if skipped kata; then
+  warn "skipped"
+elif [ -n "$active_shim" ]; then
+  ok "shim: $(command -v containerd-shim-kata-v2) → $active_shim"
+elif $check_only; then
+  bad "Kata not installed (containerd-shim-kata-v2 not on PATH)"
+elif confirm "install Kata Containers ($kata_version, $(kata_name "$kata_runtime"), ~1.2 GB download) into /opt/kata"; then
+  install_kata "$kata_version" "$kata_runtime" || true
+  active_shim="$(active_kata_shim)"
+fi
+
+# A shim from the other runtime ignores the configuration below: switch it first.
+active_runtime="$(kata_runtime_of "$active_shim")"
+if ! skipped kata && [ -n "$active_shim" ] && [ "$active_runtime" != "$kata_runtime" ]; then
+  warn "the shim in use is $(kata_name "$active_runtime"); kbx is set up for the $(kata_name "$kata_runtime") (--kata-runtime $kata_runtime)"
+  if $check_only; then
+    :
+  elif kata_running; then
+    warn "$stop_kata_first"
+  elif confirm "switch containerd-shim-kata-v2 to the $(kata_name "$kata_runtime")"; then
+    # kata-static (runtime-rs) has neither the Go shim nor its configurations.
+    if [ ! -x "$kata_shim" ] || [ ! -f "$kata_defaults/$kata_config_src" ]; then
+      fetch_kata_release || true
+    fi
+    if [ -x "$kata_shim" ]; then
+      link_kata_shim "$kata_runtime"
+      active_shim="$(active_kata_shim)"
+      if [ "$active_shim" = "$kata_shim" ]; then
+        ok "shim: $(command -v containerd-shim-kata-v2) → $active_shim"
+      else
+        bad "linked /usr/local/bin/containerd-shim-kata-v2, but $(command -v containerd-shim-kata-v2) comes first on PATH"
+      fi
+    fi
   fi
 fi
+
 if ! skipped kata && [ -d /opt/kata ]; then
-  if [ -f "$kata_config_dest" ]; then
-    ok "$kata_config_dest exists (left as is)"
+  current="$(hypervisor_of "$kata_config_dest")"
+  if [ -n "$active_shim" ] && [ "$(kata_runtime_of "$active_shim")" != "$kata_runtime" ]; then
+    # The shim in use would not read it; configure after the switch above.
+    warn "$kata_config_dest not checked: the shim in use is $(kata_name "$(kata_runtime_of "$active_shim")")"
+  elif [ ! -f "$kata_config_dest" ]; then
+    if $check_only; then
+      warn "no $kata_config_dest; Kata uses its release default (QEMU)"
+    elif kata_running && [ "$(kata_runtime_of "$active_shim")" = "$kata_runtime" ]; then
+      # Running VMs use the release default; kbx would budget them as the new hypervisor.
+      warn "no $kata_config_dest; $stop_kata_first"
+    elif confirm "use $hypervisor ($kata_defaults/$kata_config_src) as the Kata configuration"; then
+      write_kata_config || true
+    else
+      warn "no $kata_config_dest; Kata uses its release default (QEMU)"
+    fi
+  elif [ "$current" != "$hypervisor" ]; then
+    warn "$kata_config_dest selects ${current:-no single hypervisor}, not $hypervisor (--hypervisor $hypervisor)"
+    if $check_only; then
+      :
+    elif kata_running; then
+      warn "$stop_kata_first"
+    elif confirm "replace it with the $hypervisor configuration (the current one is kept as $kata_config_dest.kbx-backup)"; then
+      write_kata_config || true
+    fi
+  else
+    ok "$kata_config_dest uses $hypervisor"
     if grep -q '^reclaim_guest_freed_memory *= *false' "$kata_config_dest"; then
       warn "reclaim_guest_freed_memory = false: VMs keep freed memory until they stop (see host/kata-configuration.toml)"
     fi
-  else
-    source_config="/opt/kata/share/defaults/kata-containers/$kata_config_src"
-    if [ ! -f "$source_config" ]; then
-      warn "$source_config not found; Kata uses its default configuration"
-    elif ! $check_only && confirm "use $hypervisor ($source_config) as the Kata configuration"; then
-      as_root install -D -m 0644 "$source_config" "$kata_config_dest"
-      # Only where the hypervisor has the key (Cloud Hypervisor does).
-      as_root sed -i 's/^reclaim_guest_freed_memory *=.*/reclaim_guest_freed_memory = true/' "$kata_config_dest"
-      ok "configured $hypervisor in $kata_config_dest (see host/kata-configuration.toml)"
-    else
-      warn "no $kata_config_dest; Kata uses its built-in default"
-    fi
   fi
-  if have kata-runtime; then
+  if [ "$kata_runtime" = go ] && have kata-runtime; then
     if as_root kata-runtime check >/dev/null 2>&1; then ok "kata-runtime check passed"
     else warn "kata-runtime check reported problems: sudo kata-runtime check"; fi
+  fi
+fi
+
+# Where guest RAM lives decides whether VMs can starve the desktop of /dev/shm.
+if ! skipped kata && [ -n "$active_shim" ]; then
+  active_runtime="$(kata_runtime_of "$active_shim")"
+  active_config="$(kata_config_of "$active_runtime")" || active_config=""
+  active_hypervisor="$(hypervisor_of "$active_config")"
+  if [ "$active_runtime" = go ] && [ "$active_hypervisor" = clh ]; then
+    ok "guest RAM: memfd (Go runtime, Cloud Hypervisor), outside the /dev/shm mount"
+  else
+    backing="may be backed by /dev/shm"
+    [ "$active_hypervisor" = qemu ] && backing="is backed by /dev/shm"
+    warn "guest RAM $backing ($(kata_name "$active_runtime"), ${active_hypervisor:-unknown hypervisor} from ${active_config:-no configuration})"
+    echo "     Busy sandboxes can fill /dev/shm, and the desktop compositor then dies with SIGBUS."
+    echo "     Use the defaults (--kata-runtime go --hypervisor clh); see docs/host-setup.md, VM memory and the desktop."
   fi
 fi
 

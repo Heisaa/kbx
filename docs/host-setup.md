@@ -19,8 +19,8 @@ host/install.sh --yes --build
 
 Options: `--skip packages,docker,kata,runtime,firewall,clipboard,link`,
 `--kata-version 4.2.0`, `--kata-runtime go|rs`, `--hypervisor clh|qemu`,
-`--bridge NAME`. It never adds you to the `docker` group or restarts Docker
-without asking (`--yes` answers yes). The sections below are the manual
+`--bridge NAME`. It never adds you to the `docker` group, restarts Docker, or
+switches Kata's runtime or hypervisor without asking (`--yes` answers yes). The sections below are the manual
 equivalent.
 
 ## 1. KVM
@@ -73,23 +73,44 @@ QEMU with virtio-fs normally backs guest RAM with shared files on the host's
 `/dev/shm`. QEMU unlinks these files while keeping them open, so `ls /dev/shm`
 can be empty while `df` reports a full mount. Memory is allocated as the guest
 touches its pages; a collection of lightly used VMs can start successfully and
-fill the mount later. An exhausted mount can cause SIGBUS in the VMs or the
-desktop compositor. This does not imply a leak if stopping the VMs frees it.
+fill the mount later. This does not imply a leak if stopping the VMs frees it.
 See the [upstream Kata guide](https://github.com/kata-containers/kata-containers/blob/main/docs/how-to/how-to-use-virtio-fs-with-kata.md).
 
-Prefer Cloud Hypervisor where supported. Its normal shared memory uses `memfd`
-and is independent of the `/dev/shm` mount limit, but still consumes host RAM.
-The installer defaults to Cloud Hypervisor for a new configuration; an existing
-configuration is kept, so rerunning `install.sh --hypervisor clh` does not switch
-an existing QEMU setup. To switch the standard Go runtime configuration:
+An exhausted mount crashes whatever next writes a new page there, often the VMs
+or the desktop compositor. wlroots compositors (Sway, and others built on
+wlroots) keep their DMA-BUF format tables in `/dev/shm` and die with SIGBUS in
+`feedback_compile`; clients then report `failed to flush wayland socket: Broken
+pipe` and the session drops to a TTY. `/dev/shm` defaults to half of RAM, so with
+the default 8 GiB sandboxes two busy VMs are enough to fill it on a 32 GiB host.
+
+Use Cloud Hypervisor with the Go runtime, the tested setup and the installer's
+default. Its shared memory uses `memfd`, which is independent of the `/dev/shm`
+mount limit (it still consumes host RAM). Kata's release default configuration
+selects QEMU for both runtimes, and the runtime-rs shim reads its own
+configuration (`/etc/kata-containers/runtime-rs/configuration.toml`), so a
+configuration written for the Go runtime does not apply while
+`containerd-shim-kata-v2` points at runtime-rs.
+
+`host/install.sh` reports where guest RAM lives ("guest RAM: memfd" or a warning).
+When the shim in use or the configuration's hypervisor differs from the
+installer's choice (`--kata-runtime`, `--hypervisor`), it offers to switch: it
+unpacks `kata-go-static` of the installed version if the Go shim is missing,
+points `/usr/local/bin/containerd-shim-kata-v2` at the chosen runtime, and
+replaces the configuration (keeping `configuration.toml.kbx-backup`). It does
+not switch while Kata VMs are running. To switch by hand:
 
 1. Stop all Kata sandboxes and check that `df -h /dev/shm` falls back to low usage.
-2. Back up `/etc/kata-containers/configuration.toml`, replace it with
+2. Check that `readlink -f "$(command -v containerd-shim-kata-v2)"` is
+   `/opt/kata/bin/containerd-shim-kata-v2` (the Go runtime); relink it there if
+   it points into `/opt/kata/runtime-rs`.
+3. Back up `/etc/kata-containers/configuration.toml`, replace it with
    `/opt/kata/share/defaults/kata-containers/configuration-clh.toml`, and reapply
    the settings from `host/kata-configuration.toml` to the matching keys.
-3. Start one sandbox and verify the running process is `cloud-hypervisor`:
-   `pgrep -af 'cloud-hypervisor|qemu-system'`. Check host RAM and `/dev/shm` while
-   the sandbox runs. The new configuration applies when the next VM starts.
+4. Start one sandbox and verify the running process is `cloud-hypervisor`:
+   `pgrep -af 'cloud-hypervisor|qemu-system'`, and that its guest RAM is not on
+   `/dev/shm`: `sudo grep /dev/shm /proc/$(pgrep -f cloud-hypervisor | head -1)/maps`
+   prints nothing. Check host RAM and `/dev/shm` while the sandbox runs. The new
+   configuration applies when the next VM starts.
 
 kbx checks memory before each new VM start and serializes concurrent launches.
 Running VMs are charged by the memory they have touched, so several lightly used
